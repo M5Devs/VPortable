@@ -43,6 +43,7 @@ class SyscallProbeRunner(private val context: Context) {
                 name = "Standalone Binary Execution Probe (busybox uname -a)",
                 command = listOf(
                     busyboxPath,
+                    "busybox",
                     "uname", "-a"
                 ),
                 env = mapOf("PROOT_NO_SECCOMP" to "1")
@@ -52,6 +53,7 @@ class SyscallProbeRunner(private val context: Context) {
                 command = listOf(
                     prootPath,
                     busyboxPath,
+                    "busybox",
                     "uname", "-a"
                 ),
                 env = mapOf("PROOT_NO_SECCOMP" to "1")
@@ -61,6 +63,7 @@ class SyscallProbeRunner(private val context: Context) {
                 command = listOf(
                     prootPath,
                     busyboxPath,
+                    "busybox",
                     "id"
                 ),
                 env = mapOf("PROOT_NO_SECCOMP" to "1")
