@@ -40,20 +40,30 @@ class SyscallProbeRunner(private val context: Context) {
 
         val testCases = listOf(
             TestCase(
-                name = "PRoot Kernel Interception (uname -a)",
+                name = "Standalone Binary Execution Probe (busybox uname -a)",
+                command = listOf(
+                    busyboxPath,
+                    "uname", "-a"
+                ),
+                env = mapOf("PROOT_NO_SECCOMP" to "1")
+            ),
+            TestCase(
+                name = "PRoot Kernel Interception Probe (proot busybox uname -a)",
                 command = listOf(
                     prootPath,
                     busyboxPath,
                     "uname", "-a"
-                )
+                ),
+                env = mapOf("PROOT_NO_SECCOMP" to "1")
             ),
             TestCase(
-                name = "PRoot Syscall & User Context Probe (id)",
+                name = "PRoot Syscall & User Context Probe (proot busybox id)",
                 command = listOf(
                     prootPath,
                     busyboxPath,
                     "id"
-                )
+                ),
+                env = mapOf("PROOT_NO_SECCOMP" to "1")
             )
         )
 
@@ -61,9 +71,9 @@ class SyscallProbeRunner(private val context: Context) {
         var failureReason: String? = null
 
         for ((index, testCase) in testCases.withIndex()) {
-            emit(ProbeEvent.Log("\n[3/4.${index + 1}] Executing: ${testCase.command.joinToString(" ")}"))
+            emit(ProbeEvent.Log("\n[3/4.${index + 1}] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
 
-            val processResult = executeSubprocessSuspend(testCase.command) { logLine ->
+            val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
                 emit(ProbeEvent.Log("  $logLine"))
             }
 
@@ -90,18 +100,26 @@ class SyscallProbeRunner(private val context: Context) {
         }
     }.flowOn(Dispatchers.IO)
 
-    internal data class TestCase(val name: String, val command: List<String>)
+    internal data class TestCase(
+        val name: String,
+        val command: List<String>,
+        val env: Map<String, String> = emptyMap()
+    )
 
     internal data class ProcessOutput(val exitCode: Int, val failureBadge: String)
 
     companion object {
         internal suspend fun executeSubprocessSuspend(
             command: List<String>,
+            env: Map<String, String> = emptyMap(),
             onLine: suspend (String) -> Unit
         ): ProcessOutput {
             return try {
                 val pb = ProcessBuilder(command)
                 pb.redirectErrorStream(true)
+                if (env.isNotEmpty()) {
+                    pb.environment().putAll(env)
+                }
                 val process = pb.start()
 
                 BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
@@ -137,13 +155,18 @@ class SyscallProbeRunner(private val context: Context) {
             }
         }
 
+        @JvmOverloads
         internal fun executeSubprocess(
             command: List<String>,
+            env: Map<String, String> = emptyMap(),
             onLine: (String) -> Unit
         ): ProcessOutput {
             return try {
                 val pb = ProcessBuilder(command)
                 pb.redirectErrorStream(true)
+                if (env.isNotEmpty()) {
+                    pb.environment().putAll(env)
+                }
                 val process = pb.start()
 
                 BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
