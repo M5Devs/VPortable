@@ -18,6 +18,19 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        externalNativeBuild {
+            cmake {
+                targets("libprobe_ptrace.so")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
