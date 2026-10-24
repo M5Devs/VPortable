@@ -97,12 +97,19 @@ In a standard Android system, file ownership determines security boundaries. Und
 | `/data/system/*` | `system:system` (1000:1000) | `0771` | System configuration data |
 | `/data/app/*` | `system:system` (1000:1000) | `0771` | Installed user applications |
 
-### Permission Injection Snippet (MicroG Signature Spoofing Grant)
-To enable signature spoofing and Google service emulation for MicroG, V-Flash injects a custom permission XML file directly into `/system/etc/permissions/privapp-permissions-microg.xml`:
+### 4.1 Signature Spoofing Reality & Framework Patching Requirement
+> **Architectural Correction:** Simply dropping a permission XML defining `android.permission.FAKE_PACKAGE_SIGNATURE` into `/system/etc/permissions/` does **not** enable signature spoofing on vanilla AOSP. Stock AOSP `PackageManagerService` (PMS) contains zero internal support or recognition for `FAKE_PACKAGE_SIGNATURE`. In a vanilla AOSP rootfs, permission XML drops for `FAKE_PACKAGE_SIGNATURE` are completely ignored and silently fail.
+
+To enable MicroG Google Services emulation, the base Android 9 rootfs **must incorporate framework-level signature spoofing patches**:
+1. **Pre-Patched AOSP Rootfs (Primary Strategy):** The base Android 9 system image (`services.jar` / `framework.jar`) is pre-compiled with the LineageOS for microG signature spoofing patch directly integrated into `com.android.server.pm.PackageManagerService`.
+2. **Dynamic Userspace Framework Hooking (Alternative):** Injected at runtime via userspace bytecode manipulation or Java runtime hooking when initializing `system_server`.
+
+Once PMS is patched to support `FAKE_PACKAGE_SIGNATURE`, permission XMLs injected into `/system/etc/permissions/privapp-permissions-microg.xml` grant signature spoofing privileges to GmsCore:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
 <permissions>
+    <!-- Requires pre-patched PackageManagerService in base Android 9 rootfs -->
     <privapp-permissions package="com.google.android.gms">
         <permission name="android.permission.FAKE_PACKAGE_SIGNATURE"/>
         <permission name="android.permission.INSTALL_LOCATION_PROVIDER"/>
@@ -121,3 +128,20 @@ To allow users to modify, reset, or upgrade add-ons without destroying their roo
 1. **Manifest Tracker (`/data/data/com.m5dev.vportable/vflash_manifest.json`):** Tracks every file injected by a specific ZIP package hash.
 2. **Atomic Uninstall:** To remove an add-on, V-Flash reads the manifest, removes injected binaries and permission files, and triggers a PRoot cache flush.
 3. **Safety Backup State:** Before applying an add-on, V-Flash creates a lightweight differential snapshot of affected directories (`/system/priv-app`, `/system/etc`).
+
+---
+
+## 6. Process Memory Isolation Caveats in User-Space Sandboxing
+
+Because VPortable operates as a rootless user-space container inside an unprivileged host Android application, traditional Linux kernel-level process isolation between guest processes is subject to architectural constraints.
+
+### 6.1 Syscall Interception vs. Memory Mapping (`mmap`)
+- **Syscall Boundaries:** PRoot/Seccomp intercepts and validates control-plane system calls (`openat`, `execve`, `mount`, `socket`, `unlink`). File paths and POSIX privileges are enforced at these interception boundaries.
+- **Post-`mmap` Memory Boundary Limitation:** Once a guest sub-process maps memory pages via `mmap()`, direct memory access occurs strictly within CPU user-mode without generating system calls.
+- **Same-UID Memory Access:** All guest processes (guest `init`, `servicemanager`, and guest applications) run on the host Linux kernel as child processes under the host application's single unprivileged UID (e.g., `u0_a142`).
+- **Consequence:** Under Linux DAC (Discretionary Access Control), processes sharing the same real UID possess permission to issue `process_vm_readv`, `process_vm_writev`, or `ptrace` against sibling processes unless explicitly blocked by host SELinux or `prctl(PR_SET_DUMPABLE)`.
+
+### 6.1 Defense-in-Depth Mitigation
+While raw memory isolation between guest processes under a single host UID cannot be enforced purely by kernel boundaries without hardware virtualization, VPortable enforces user-space mitigations:
+- Calling `prctl(PR_SET_DUMPABLE, 0)` on spawned guest processes to restrict ptrace attachment by sibling processes.
+- Intercepting and blocking `ptrace` and process memory inspection syscalls initiated by untrusted guest app binaries.
