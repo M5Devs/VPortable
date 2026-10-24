@@ -31,7 +31,8 @@ VPortable leverages user-space syscall interception using Linux ptrace and `secc
 | |  |                     Guest Android 9 (Pie) Rootfs                        |  | |
 | |  |                                                                         |  | |
 | |  | +-----------------+  +----------------------+  +---------------------+  | |
-| |  | | Android `init`  |  | `servicemanager`     |  | Guest Apps / APKs   |  | |
+| |  | | Android `init`  |  | Userspace Binder     |  | Guest Apps / APKs   |  | |
+| |  | |                 |  | (RPC over Sockets)   |  |                     |  | |
 | |  | +-----------------+  +----------------------+  +---------------------+  | |
 | |  +-------------------------------------------------------------------------+  | |
 | +-------------------------------------------------------------------------------+ |
@@ -63,8 +64,8 @@ VPortable is architected around four distinct, decoupled subsystems:
 ### Pillar 3: Guest Android 9 (Pie) Rootfs
 - **System Image:** Clean, stripped Android 9.0.0 (AOSP Pie) ARM64 / x86_64 rootfs image optimized for light footprints (~250MB - 500MB).
 - **Responsibilities:**
-  - Runs modified AOSP system components (`/system/bin/app_process64`, `/system/bin/servicemanager`).
-  - Hosts guest applications, Google Play Services / MicroG, and system permissions.
+  - Runs modified AOSP system components (`/system/bin/app_process64`, userspace `servicemanager`).
+  - Hosts guest applications, pre-patched Google Play Services / MicroG, and system permissions.
   - Maintains guest `/data/app`, `/data/data`, and `/system/priv-app` hierarchies.
 
 ### Pillar 4: Virtual Graphics Engine
@@ -73,7 +74,7 @@ VPortable is architected around four distinct, decoupled subsystems:
   - Emulates an Android display driver pipeline (`hwcomposer` / Goldfish OpenGL / Gfxstream driver).
   - Listens on guest UNIX domain socket `/dev/socket/gfxstream_vportable`.
   - Deserializes GLES / EGL command streams sent by guest `SurfaceFlinger` / applications.
-  - Translates and executes graphics calls on host GPU contexts, rendering directly into an host `SurfaceView` / `ANativeWindow`.
+  - Translates and executes graphics calls on host GPU contexts, rendering directly into a host `SurfaceView` / `ANativeWindow`.
 
 ---
 
@@ -98,9 +99,8 @@ sequenceDiagram
     Note over GuestInit: Executing in VPortable chroot context
     GuestInit->>PRoot: Syscall: mount("/dev", ...)
     PRoot-->>GuestInit: Intercepted -> Faked Success (0)
-    GuestInit->>GuestService: Spawns servicemanager
-    GuestService->>PRoot: Syscall: open("/dev/binder")
-    PRoot-->>GuestService: Redirected to /dev/binder_vportable socket
+    GuestInit->>GuestService: Spawns userspace servicemanager
+    GuestService->>GuestService: Bind Userspace Binder (RPC over UNIX Sockets)
     Note over GuestService: Guest app sends GLES rendering commands
     GuestService->>HostGfx: Stream EGL/GLES commands via UNIX socket
     HostGfx->>HostApp: Render frame to ANativeWindow / SurfaceView
@@ -110,11 +110,58 @@ sequenceDiagram
 1. **JNI Command Channel:** Host Kotlin Controller communicates with `librunner.so` (Rust) to dispatch execution signals (`start`, `kill`, `install_apk`).
 2. **Ptrace / Seccomp Unotify Channel:** Kernel notifies PRoot supervisor via file descriptor on every guest syscall requiring path translation or privilege emulation.
 3. **Graphics Pipe (UNIX Domain Socket):** `/dev/socket/gfxstream_vportable` facilitates zero-copy IPC for OpenGL command streams between guest graphics drivers and host rendering thread.
-4. **Virtual Binder / IPC Relay:** Intercepts Binder transactions requiring host-side translation (e.g., input event injections, audio track streams).
+4. **Userspace Binder-over-Sockets (RPC/Sockets):** Replaces kernel `/dev/binder` passthrough (which fails due to the `BINDER_SET_CONTEXT_MGR` single context manager restriction). Guest processes communicate via a userspace `libbinder` socket relay (`RpcSession` / RPC Binder protocol) bound to local UNIX domain sockets.
 
 ---
 
-## 4. Directory Structure & Workspace Layout
+## 4. Risk-First Gating & MVP Implementation Roadmap
+
+To avoid building higher-level abstractions on invalid architectural assumptions, VPortable's implementation sequence prioritizes **Risk-First Gating**. Progress to subsequent gates is strictly blocked until the preceding gate passes real-device validation.
+
+```mermaid
+flowchart TD
+    G1[Gate 1: OEM Syscall Interception Feasibility] -->|PASS: ptrace & seccomp validated on Knox/MIUI/Pixel| G2[Gate 2: Userspace Binder Engine]
+    G2 -->|PASS: RPC/Sockets binder transactions working| G3[Gate 3: Android 9 Rootless Init Bootstrap]
+    G3 -->|PASS: Init, VFS mounts, and daemon hierarchy running| G4[Gate 4: Virtual Display & V-Flash Engine]
+
+    G1 -- FAIL --> R1[Fallback: Single-thread ptrace / OEM mitigation]
+    G2 -- FAIL --> R2[Fallback: Hardened IPC Proxy]
+```
+
+### Gate 1: OEM Feasibility & Low-Level Syscall Interception Gate
+- **Objective:** Validate that host `untrusted_app` SELinux restrictions and OEM security enhancements (Samsung Knox, Xiaomi MIUI, Huawei EMUI, Google Pixel) do not block required syscall interception primitives.
+- **Scope & Deliverables:**
+  - Build a minimal static test binary (e.g., BusyBox) running under a minimal PRoot runner inside an unprivileged Android application container.
+  - Test `ptrace(PTRACE_SYSCALL)`, `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)`, and `process_vm_readv()` across target OEM hardware.
+  - Verify behavior under OEM process killing heuristics, Knox SELinux policies, and Android API 28+ app sandbox constraints.
+- **Gating Criteria:** Mandatory verification on physical Samsung Knox and MIUI test devices prior to developing full Android init or framework components.
+
+### Gate 2: Userspace Binder (RPC / Sockets) Strategy Gate
+- **Objective:** Establish guest-internal inter-process communication without relying on host kernel `/dev/binder` passthrough.
+- **Scope & Deliverables:**
+  - Implement a userspace `servicemanager` and RPC Binder transport layer utilizing Android 12+ `RpcSession` / userspace `libbinder` emulation over UNIX domain sockets.
+  - Validate process-to-process AIDL transactions (`IServiceManager`, `IActivityManager`, `IPackageManager`) entirely in user-space.
+- **Gating Criteria:** Successful end-to-end AIDL transaction benchmark without kernel Binder driver involvement.
+
+### Gate 3: Android 9 Rootless `init` Bootstrap & VFS Mounts
+- **Objective:** Bootstrap modified AOSP 9.0 (Pie) `./init` binary within the PRoot virtual environment.
+- **Scope & Deliverables:**
+  - Emulate rootfs mounts (`/dev`, `/proc`, `/sys`, `/system`, `/data`).
+  - Intercept and mock SELinux reads (`/sys/fs/selinux/enforce`), `setcon()`, and `getcon()`.
+  - Spawn guest daemon hierarchy: `servicemanager` -> `zygote` -> `system_server`.
+- **Gating Criteria:** Guest `system_server` reaching ready state and spawning guest app processes.
+
+### Gate 4: Virtual Display (Goldfish OpenGL) & V-Flash Engine
+- **Objective:** Deliver hardware-accelerated rendering and add-on package installation.
+- **Scope & Deliverables:**
+  - Connect guest `SurfaceFlinger` / Goldfish driver to host Gfxstream decoder via UNIX domain socket `/dev/socket/gfxstream_vportable`.
+  - Bind host `SurfaceView` / `ANativeWindow` to host EGL context.
+  - Implement V-Flash manifest-driven package installation operating on pre-patched rootfs images (LineageOS for microG PMS signature spoofing).
+- **Gating Criteria:** 60 FPS interactive rendering on host display with full MicroG signature spoofing capabilities.
+
+---
+
+## 5. Directory Structure & Workspace Layout
 
 ```
 /
