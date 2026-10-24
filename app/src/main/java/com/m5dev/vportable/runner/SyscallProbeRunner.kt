@@ -1,7 +1,6 @@
 package com.m5dev.vportable.runner
 
 import android.content.Context
-import com.m5dev.vportable.util.BinaryExtractor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -20,29 +19,22 @@ class SyscallProbeRunner(private val context: Context) {
     fun runGate1Probe(): Flow<ProbeEvent> = flow {
         emit(ProbeEvent.Log("=== Gate 1: Minimal PRoot & Syscall Feasibility Test ==="))
 
-        val extractor = BinaryExtractor(context)
-        emit(ProbeEvent.Log("[1/4] Resolving binaries (proot, busybox)..."))
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val prootPath = "$nativeDir/libproot.so"
+        val busyboxPath = "$nativeDir/libbusybox.so"
 
-        val resolveResult = extractor.resolveOrExtractBinaries()
-        if (resolveResult.isFailure) {
-            val err = resolveResult.exceptionOrNull()
-            emit(ProbeEvent.Log("ERROR: Binary resolution failed: ${err?.message}"))
-            emit(ProbeEvent.Completed(false, "FAILED: EXTRACTION_ERROR", false))
-            return@flow
-        }
+        emit(ProbeEvent.Log("[1/4] Resolving binaries ($prootPath, $busyboxPath)..."))
 
-        val binDir = resolveResult.getOrThrow()
-
-        val prootBinary = if (File(binDir, "libproot.so").exists()) File(binDir, "libproot.so") else File(binDir, "proot")
-        val busyboxBinary = if (File(binDir, "libbusybox.so").exists()) File(binDir, "libbusybox.so") else File(binDir, "busybox")
+        val prootBinary = File(prootPath)
+        val busyboxBinary = File(busyboxPath)
 
         if (!prootBinary.exists() || !busyboxBinary.exists()) {
-            emit(ProbeEvent.Log("ERROR: Binaries missing in ${binDir.absolutePath}"))
+            emit(ProbeEvent.Log("ERROR: Binaries missing in $nativeDir"))
             emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
             return@flow
         }
 
-        emit(ProbeEvent.Log("[2/4] Binaries verified at ${binDir.absolutePath}"))
+        emit(ProbeEvent.Log("[2/4] Binaries verified at $nativeDir"))
         emit(ProbeEvent.Log("       proot binary: ${prootBinary.name} (executable: ${prootBinary.canExecute()})"))
         emit(ProbeEvent.Log("       busybox binary: ${busyboxBinary.name} (executable: ${busyboxBinary.canExecute()})"))
 
@@ -50,16 +42,16 @@ class SyscallProbeRunner(private val context: Context) {
             TestCase(
                 name = "PRoot Kernel Interception (uname -a)",
                 command = listOf(
-                    prootBinary.absolutePath,
-                    busyboxBinary.absolutePath,
+                    prootPath,
+                    busyboxPath,
                     "uname", "-a"
                 )
             ),
             TestCase(
                 name = "PRoot Syscall & User Context Probe (id)",
                 command = listOf(
-                    prootBinary.absolutePath,
-                    busyboxBinary.absolutePath,
+                    prootPath,
+                    busyboxPath,
                     "id"
                 )
             )
