@@ -96,12 +96,23 @@
 #endif
 #endif
 
+#ifndef __NR_chdir
+#if defined(__x86_64__)
+#define __NR_chdir 80
+#elif defined(__aarch64__)
+#define __NR_chdir 49
+#elif defined(__i386__) || defined(__arm__)
+#define __NR_chdir 12
+#endif
+#endif
+
 extern char **environ;
 
 #if defined(__x86_64__)
 typedef struct user_regs_struct arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).rsp)
 #define ARCH_SYSCALL_NR(regs) ((long)(regs).orig_rax)
+#define ARCH_RET(regs) ((long)(regs).rax)
 #define ARCH_ARG1(regs) ((uintptr_t)(regs).rdi)
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).rsi)
 #define SET_ARCH_ARG1(regs, val) ((regs).rdi = (unsigned long long)(val))
@@ -110,6 +121,7 @@ typedef struct user_regs_struct arch_regs_t;
 typedef struct user_pt_regs arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).sp)
 #define ARCH_SYSCALL_NR(regs) ((long)(regs).regs[8])
+#define ARCH_RET(regs) ((long)(regs).regs[0])
 #define ARCH_ARG1(regs) ((uintptr_t)(regs).regs[0])
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).regs[1])
 #define SET_ARCH_ARG1(regs, val) ((regs).regs[0] = (__u64)(val))
@@ -118,6 +130,7 @@ typedef struct user_pt_regs arch_regs_t;
 typedef struct user_regs arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).uregs[13])
 #define ARCH_SYSCALL_NR(regs) ((long)(regs).uregs[7])
+#define ARCH_RET(regs) ((long)(regs).uregs[0])
 #define ARCH_ARG1(regs) ((uintptr_t)(regs).uregs[0])
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).uregs[1])
 #define SET_ARCH_ARG1(regs, val) ((regs).uregs[0] = (unsigned long)(val))
@@ -126,19 +139,22 @@ typedef struct user_regs arch_regs_t;
 typedef struct user_regs_struct arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).esp)
 #define ARCH_SYSCALL_NR(regs) ((long)(regs).orig_eax)
+#define ARCH_RET(regs) ((long)(regs).eax)
 #define ARCH_ARG1(regs) ((uintptr_t)(regs).ebx)
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).ecx)
 #define SET_ARCH_ARG1(regs, val) ((regs).ebx = (unsigned long)(val))
 #define SET_ARCH_ARG2(regs, val) ((regs).ecx = (unsigned long)(val))
 #endif
 
-// ---------------- Process Tracking Table ----------------
+// ---------------- Process Tracking Table with CWD ----------------
 #define MAX_TRACKED_PIDS 64
 typedef struct {
     pid_t pid;
     int in_syscall;
     long last_syscall;
     int is_active;
+    char cwd[1024];
+    char pending_chdir[1024];
 } pid_state_t;
 
 static pid_state_t pid_table[MAX_TRACKED_PIDS];
@@ -158,6 +174,8 @@ static pid_state_t* get_or_create_pid(pid_t pid) {
         pid_table[free_idx].in_syscall = 0;
         pid_table[free_idx].last_syscall = -1;
         pid_table[free_idx].is_active = 1;
+        strcpy(pid_table[free_idx].cwd, "/");
+        pid_table[free_idx].pending_chdir[0] = '\0';
         return &pid_table[free_idx];
     }
     return NULL;
@@ -210,6 +228,20 @@ static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size
         }
     }
     return 0;
+}
+
+// Helper: resolve relative path against process CWD
+static void resolve_relative_or_absolute(const char *in_path, const char *cwd, char *out_path, size_t out_size) {
+    if (in_path[0] == '/') {
+        strncpy(out_path, in_path, out_size - 1);
+        out_path[out_size - 1] = '\0';
+    } else {
+        if (strcmp(cwd, "/") == 0) {
+            snprintf(out_path, out_size, "/%s", in_path);
+        } else {
+            snprintf(out_path, out_size, "%s/%s", cwd, in_path);
+        }
+    }
 }
 
 // ---------------- Memory & Reg Helpers ----------------
@@ -274,9 +306,9 @@ int main(int argc, char *argv[]) {
         int fd = syscall(__NR_openat, AT_FDCWD, "/bin/sh", O_RDONLY, 0);
         if (fd >= 0) close(fd);
 
-        // Gate 3.1 Multi-Process Pipeline Test
-        char *exec_args[] = { "sh", "-c", "echo VPORTABLE_GATE_3_1_SUCCESS | cat", NULL };
-        printf("CHILD: Invoking Pipeline: /bin/sh -c \"echo VPORTABLE_GATE_3_1_SUCCESS | cat\"...\n");
+        // Gate 3.2 CWD Test: cd /etc && cat hostname
+        char *exec_args[] = { "sh", "-c", "cd /etc && cat hostname", NULL };
+        printf("CHILD: Invoking: /bin/sh -c \"cd /etc && cat hostname\"...\n");
         fflush(stdout);
 
         execve("/bin/sh", exec_args, environ);
@@ -320,8 +352,11 @@ int main(int argc, char *argv[]) {
                 unsigned long new_child = 0;
                 ptrace(PTRACE_GETEVENTMSG, cur_pid, NULL, &new_child);
                 if (new_child > 0) {
-                    get_or_create_pid((pid_t)new_child);
-                    printf("SUPERVISOR: Attached to forked child PID=%lu\n", new_child);
+                    pid_state_t *new_ps = get_or_create_pid((pid_t)new_child);
+                    if (new_ps) {
+                        strncpy(new_ps->cwd, ps->cwd, sizeof(new_ps->cwd));
+                    }
+                    printf("SUPERVISOR: Attached to child PID=%lu (inherited CWD=%s)\n", new_child, ps->cwd);
                     fflush(stdout);
                 }
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
@@ -338,15 +373,39 @@ int main(int argc, char *argv[]) {
                         ps->last_syscall = nr;
                         uintptr_t sp = ARCH_SP(regs);
 
-                        if (nr == __NR_openat || nr == __NR_newfstatat) {
+                        if (nr == __NR_chdir) {
+                            uintptr_t path_addr = ARCH_ARG1(regs);
+                            if (path_addr != 0) {
+                                char raw_path[1024] = {0};
+                                struct iovec l_iov = { .iov_base = raw_path, .iov_len = sizeof(raw_path)-1 };
+                                struct iovec r_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(raw_path)-1 };
+                                if (process_vm_readv(cur_pid, &l_iov, 1, &r_iov, 1, 0) > 0) {
+                                    char full_virtual[1024] = {0};
+                                    resolve_relative_or_absolute(raw_path, ps->cwd, full_virtual, sizeof(full_virtual));
+                                    strncpy(ps->pending_chdir, full_virtual, sizeof(ps->pending_chdir));
+
+                                    char rew_path[2048] = {0};
+                                    if (resolve_vfs_path(full_virtual, rew_path, sizeof(rew_path))) {
+                                        uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
+                                        if (scr != 0) {
+                                            SET_ARCH_ARG1(regs, scr);
+                                            set_child_regs(cur_pid, &regs);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (nr == __NR_openat || nr == __NR_newfstatat) {
                             uintptr_t path_addr = ARCH_ARG2(regs);
                             if (path_addr != 0) {
-                                char cpath[1024] = {0};
-                                struct iovec l_iov = { .iov_base = cpath, .iov_len = sizeof(cpath)-1 };
-                                struct iovec r_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(cpath)-1 };
+                                char raw_path[1024] = {0};
+                                struct iovec l_iov = { .iov_base = raw_path, .iov_len = sizeof(raw_path)-1 };
+                                struct iovec r_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(raw_path)-1 };
                                 if (process_vm_readv(cur_pid, &l_iov, 1, &r_iov, 1, 0) > 0) {
+                                    char full_virtual[1024] = {0};
+                                    resolve_relative_or_absolute(raw_path, ps->cwd, full_virtual, sizeof(full_virtual));
+
                                     char rew_path[2048] = {0};
-                                    if (resolve_vfs_path(cpath, rew_path, sizeof(rew_path))) {
+                                    if (resolve_vfs_path(full_virtual, rew_path, sizeof(rew_path))) {
                                         uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
                                         if (scr != 0) {
                                             SET_ARCH_ARG2(regs, scr);
@@ -358,12 +417,15 @@ int main(int argc, char *argv[]) {
                         } else if (nr == __NR_execve) {
                             uintptr_t path_addr = ARCH_ARG1(regs);
                             if (path_addr != 0) {
-                                char cpath[1024] = {0};
-                                struct iovec l_iov = { .iov_base = cpath, .iov_len = sizeof(cpath)-1 };
-                                struct iovec r_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(cpath)-1 };
+                                char raw_path[1024] = {0};
+                                struct iovec l_iov = { .iov_base = raw_path, .iov_len = sizeof(raw_path)-1 };
+                                struct iovec r_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(raw_path)-1 };
                                 if (process_vm_readv(cur_pid, &l_iov, 1, &r_iov, 1, 0) > 0) {
-                                    if (strncmp(cpath, "/bin/", 5) == 0) {
-                                        const char *applet = cpath + 5;
+                                    char full_virtual[1024] = {0};
+                                    resolve_relative_or_absolute(raw_path, ps->cwd, full_virtual, sizeof(full_virtual));
+
+                                    if (strncmp(full_virtual, "/bin/", 5) == 0) {
+                                        const char *applet = full_virtual + 5;
                                         char busybox_path[2048] = {0};
                                         snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", native_lib_dir);
                                         uintptr_t scr = write_to_child_scratch(cur_pid, sp, busybox_path, strlen(busybox_path)+1);
@@ -372,7 +434,7 @@ int main(int argc, char *argv[]) {
                                             ensure_argv0(cur_pid, ARCH_ARG2(regs), scr, applet);
                                             set_child_regs(cur_pid, &regs);
                                             printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s (applet=%s)\n",
-                                                   cur_pid, cpath, busybox_path, applet);
+                                                   cur_pid, full_virtual, busybox_path, applet);
                                             fflush(stdout);
                                         }
                                     }
@@ -382,14 +444,23 @@ int main(int argc, char *argv[]) {
                     }
                 } else {
                     ps->in_syscall = 0;
+                    if (ps->last_syscall == __NR_chdir && ps->pending_chdir[0] != '\0') {
+                        arch_regs_t regs;
+                        if (get_child_regs(cur_pid, &regs) == 0) {
+                            if (ARCH_RET(regs) == 0) {
+                                strncpy(ps->cwd, ps->pending_chdir, sizeof(ps->cwd));
+                                printf("SUPERVISOR [PID=%d]: chdir successful, updated CWD=%s\n", cur_pid, ps->cwd);
+                                fflush(stdout);
+                            }
+                        }
+                        ps->pending_chdir[0] = '\0';
+                    }
                 }
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else if (sig == SIGTRAP) {
-                // Exec-stop! Reset syscall tracking for new image
                 ps->in_syscall = 0;
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else if (sig == SIGSTOP) {
-                // New child initial stop
                 ptrace(PTRACE_SETOPTIONS, cur_pid, NULL, (void*)options);
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else {
@@ -398,7 +469,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("GATE_3_1_RESULT: MULTI_PROCESS_SUCCESS\n");
+    printf("GATE_3_2_RESULT: CWD_ROOTFS_SUCCESS\n");
     fflush(stdout);
     return 0;
 }
