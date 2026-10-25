@@ -82,10 +82,11 @@ class SyscallProbeRunner(private val context: Context) {
         }
     }.flowOn(Dispatchers.IO)
 
-    fun runGate2Probe(): Flow<ProbeEvent> = runGate3_1Probe()
+    fun runGate2Probe(): Flow<ProbeEvent> = runGate3_2Probe()
+    fun runGate3_1Probe(): Flow<ProbeEvent> = runGate3_2Probe()
 
-    fun runGate3_1Probe(): Flow<ProbeEvent> = flow {
-        emit(ProbeEvent.Log("=== Gate 3.1: Multi-Process Supervision, Mount Table & Pipeline Execution ==="))
+    fun runGate3_2Probe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 3.2: CWD Tracking & Mini-Rootfs Execution ==="))
 
         val rootfsDir = File(context.filesDir, "rootfs")
         val binDir = File(rootfsDir, "bin")
@@ -102,6 +103,9 @@ class SyscallProbeRunner(private val context: Context) {
         stagedCatFile.writeText("#!/bin/sh\n")
         stagedCatFile.setExecutable(true, false)
 
+        val hostnameFile = File(etcDir, "hostname")
+        hostnameFile.writeText("vportable-node1\n")
+
         val nativeDir = context.applicationInfo.nativeLibraryDir
         val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
         val nativeBusyboxPath = "$nativeDir/libbusybox.so"
@@ -109,8 +113,7 @@ class SyscallProbeRunner(private val context: Context) {
         emit(ProbeEvent.Log("[1/4] Staging virtual rootfs structure in ${rootfsDir.absolutePath}..."))
         emit(ProbeEvent.Log("       Rootfs bin: ${binDir.absolutePath}"))
         emit(ProbeEvent.Log("       Rootfs etc: ${etcDir.absolutePath}"))
-        emit(ProbeEvent.Log("       Staged shell marker: ${stagedShFile.absolutePath}"))
-        emit(ProbeEvent.Log("       Staged cat marker: ${stagedCatFile.absolutePath}"))
+        emit(ProbeEvent.Log("       Staged hostname: ${hostnameFile.absolutePath} (content: vportable-node1)"))
 
         val ptraceBinary = File(nativePtraceProbePath)
         val busyboxBinary = File(nativeBusyboxPath)
@@ -131,12 +134,12 @@ class SyscallProbeRunner(private val context: Context) {
         emit(ProbeEvent.Log("       Supervisor: ${ptraceBinary.name} (canExecute: ${ptraceBinary.canExecute()})"))
         emit(ProbeEvent.Log("       BusyBox: ${busyboxBinary.name} (canExecute: ${busyboxBinary.canExecute()})"))
 
-        val targetCmd = "echo VPORTABLE_GATE_3_1_SUCCESS | cat"
+        val targetCmd = "cd /etc && cat hostname"
         val env = mapOf("PROOT_NO_SECCOMP" to "1")
         val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir, targetCmd)
 
         val testCase = TestCase(
-            name = "Gate 3.1 Multi-Process Supervisor Pipeline Probe",
+            name = "Gate 3.2 CWD & Rootfs Probe",
             command = command,
             env = env
         )
@@ -148,31 +151,29 @@ class SyscallProbeRunner(private val context: Context) {
 
         val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
             emit(ProbeEvent.Log("  $logLine"))
-            if (logLine.contains("VPORTABLE_GATE_3_1_SUCCESS")) {
+            if (logLine.contains("vportable-node1")) {
                 shellSuccessOutput = true
             }
-            if (logLine.contains("SUPERVISOR [PID") || logLine.contains("Tracked new child PID")) {
-                val pidMatch = Regex("""PID (\d+)""").find(logLine)
-                pidMatch?.groupValues?.get(1)?.let { pid ->
-                    detectedPids.add(pid)
-                }
+            val pidMatch = Regex("""PID[= ](\d+)""").find(logLine)
+            pidMatch?.groupValues?.get(1)?.let { pid ->
+                detectedPids.add(pid)
             }
         }
 
         val success = processResult.exitCode == 0 && shellSuccessOutput
 
         if (success) {
-            emit(ProbeEvent.Log("  -> Shell pipeline command executed successfully in virtual environment (SUCCESS)"))
+            emit(ProbeEvent.Log("  -> CWD traversal & file read successfully verified (SUCCESS)"))
             emit(ProbeEvent.Log("  -> Interception confirmed across ${detectedPids.size} PIDs: ${detectedPids.joinToString(", ")}"))
         } else {
             val reason = processResult.failureBadge
             emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
         }
 
-        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 3.1 Feasibility Results..."))
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 3.2 Feasibility Results..."))
         if (success) {
-            emit(ProbeEvent.Log("SUCCESS: Multi-process supervision, mount table & pipeline execution validated."))
-            emit(ProbeEvent.Completed(true, "PASSED (GATE 3.1)", true))
+            emit(ProbeEvent.Log("SUCCESS: Multi-process CWD tracking & VFS mini-rootfs validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (GATE 3.2)", true))
         } else {
             val badge = if (processResult.exitCode != 0) {
                 when (processResult.exitCode) {
@@ -183,7 +184,7 @@ class SyscallProbeRunner(private val context: Context) {
                     else -> "FAILED: EXIT_${processResult.exitCode}"
                 }
             } else {
-                "FAILED: VFS_GATE_3_1_EXEC_FAILED"
+                "FAILED: VFS_GATE_3_2_FAILED"
             }
             emit(ProbeEvent.Log("FAILURE: $badge"))
             emit(ProbeEvent.Completed(false, badge, false))
@@ -203,53 +204,6 @@ class SyscallProbeRunner(private val context: Context) {
             command: List<String>,
             env: Map<String, String> = emptyMap(),
             onLine: suspend (String) -> Unit
-        ): ProcessOutput {
-            return try {
-                val pb = ProcessBuilder(command)
-                pb.redirectErrorStream(true)
-                if (env.isNotEmpty()) {
-                    pb.environment().putAll(env)
-                }
-                val process = pb.start()
-
-                BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null) {
-                        line?.let { onLine(it) }
-                    }
-                }
-
-                val exitCode = process.waitFor()
-                val badge = when (exitCode) {
-                    0 -> "PASSED"
-                    126 -> "FAILED: EPERM"
-                    127 -> "FAILED: ENOENT"
-                    139 -> "FAILED: SIGSEGV"
-                    159 -> "FAILED: SIGSYS"
-                    else -> "FAILED: EXIT_$exitCode"
-                }
-                ProcessOutput(exitCode, badge)
-            } catch (e: SecurityException) {
-                onLine("SecurityException during execution: ${e.message}")
-                ProcessOutput(-1, "FAILED: PTRACE_DENIED")
-            } catch (e: Exception) {
-                onLine("Exception during execution: ${e.javaClass.simpleName} - ${e.message}")
-                val badge = if (e.message?.contains("No such file", ignoreCase = true) == true) {
-                    "FAILED: ENOENT"
-                } else if (e.message?.contains("Permission denied", ignoreCase = true) == true) {
-                    "FAILED: EPERM"
-                } else {
-                    "FAILED: ${e.javaClass.simpleName}"
-                }
-                ProcessOutput(-1, badge)
-            }
-        }
-
-        @JvmOverloads
-        internal fun executeSubprocess(
-            command: List<String>,
-            env: Map<String, String> = emptyMap(),
-            onLine: (String) -> Unit
         ): ProcessOutput {
             return try {
                 val pb = ProcessBuilder(command)
