@@ -1,7 +1,6 @@
 package com.m5dev.vportable.runner
 
 import android.content.Context
-import com.m5dev.vportable.util.BinaryExtractor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -18,98 +17,80 @@ sealed class ProbeEvent {
 class SyscallProbeRunner(private val context: Context) {
 
     fun runGate1Probe(): Flow<ProbeEvent> = flow {
-        emit(ProbeEvent.Log("=== Gate 1: Minimal PRoot & Syscall Feasibility Test ==="))
+        emit(ProbeEvent.Log("=== Gate 1: Minimal Native Ptrace & Syscall Feasibility Test ==="))
 
-        val extractor = BinaryExtractor(context)
-        emit(ProbeEvent.Log("[1/4] Resolving binaries (proot, busybox)..."))
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
 
-        val resolveResult = extractor.resolveOrExtractBinaries()
-        if (resolveResult.isFailure) {
-            val err = resolveResult.exceptionOrNull()
-            emit(ProbeEvent.Log("ERROR: Binary resolution failed: ${err?.message}"))
-            emit(ProbeEvent.Completed(false, "FAILED: EXTRACTION_ERROR", false))
-            return@flow
-        }
+        emit(ProbeEvent.Log("[1/4] Resolving native probe ($nativePtraceProbePath)..."))
 
-        val binDir = resolveResult.getOrThrow()
+        val ptraceBinary = File(nativePtraceProbePath)
 
-        val prootBinary = if (File(binDir, "libproot.so").exists()) File(binDir, "libproot.so") else File(binDir, "proot")
-        val busyboxBinary = if (File(binDir, "libbusybox.so").exists()) File(binDir, "libbusybox.so") else File(binDir, "busybox")
-
-        if (!prootBinary.exists() || !busyboxBinary.exists()) {
-            emit(ProbeEvent.Log("ERROR: Binaries missing in ${binDir.absolutePath}"))
+        if (!ptraceBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: Native probe missing in $nativeDir"))
             emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
             return@flow
         }
 
-        emit(ProbeEvent.Log("[2/4] Binaries verified at ${binDir.absolutePath}"))
-        emit(ProbeEvent.Log("       proot binary: ${prootBinary.name} (executable: ${prootBinary.canExecute()})"))
-        emit(ProbeEvent.Log("       busybox binary: ${busyboxBinary.name} (executable: ${busyboxBinary.canExecute()})"))
+        emit(ProbeEvent.Log("[2/4] Native probe verified at $nativeDir"))
+        emit(ProbeEvent.Log("       ptrace probe: ${ptraceBinary.name} (executable: ${ptraceBinary.canExecute()})"))
 
-        val testCases = listOf(
-            TestCase(
-                name = "PRoot Kernel Interception (uname -a)",
-                command = listOf(
-                    prootBinary.absolutePath,
-                    busyboxBinary.absolutePath,
-                    "uname", "-a"
-                )
-            ),
-            TestCase(
-                name = "PRoot Syscall & User Context Probe (id)",
-                command = listOf(
-                    prootBinary.absolutePath,
-                    busyboxBinary.absolutePath,
-                    "id"
-                )
-            )
+        val testCase = TestCase(
+            name = "Native C Ptrace & Syscall Interception Probe (libprobe_ptrace.so)",
+            command = listOf(nativePtraceProbePath)
         )
 
-        var overallSuccess = true
-        var failureReason: String? = null
+        emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
 
-        for ((index, testCase) in testCases.withIndex()) {
-            emit(ProbeEvent.Log("\n[3/4.${index + 1}] Executing: ${testCase.command.joinToString(" ")}"))
+        var ptraceSuccessDetected = false
 
-            val processResult = executeSubprocessSuspend(testCase.command) { logLine ->
-                emit(ProbeEvent.Log("  $logLine"))
-            }
-
-            if (processResult.exitCode == 0) {
-                emit(ProbeEvent.Log("  -> Subprocess exited with code 0 (SUCCESS)"))
-            } else {
-                overallSuccess = false
-                val reason = processResult.failureBadge
-                emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
-                if (failureReason == null) {
-                    failureReason = reason
-                }
+        val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
+            emit(ProbeEvent.Log("  $logLine"))
+            if (logLine.contains("GATE_1_RESULT: PTRACE_TRACEME_SUCCESS")) {
+                ptraceSuccessDetected = true
             }
         }
 
+        val success = processResult.exitCode == 0 || ptraceSuccessDetected
+
+        if (success) {
+            emit(ProbeEvent.Log("  -> Subprocess exited successfully / ptrace validated (SUCCESS)"))
+        } else {
+            val reason = processResult.failureBadge
+            emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
+        }
+
         emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 1 Feasibility Gate Results..."))
-        if (overallSuccess) {
-            emit(ProbeEvent.Log("SUCCESS: PRoot ptrace & syscall interception validated on host SELinux domain."))
+        if (success) {
+            emit(ProbeEvent.Log("SUCCESS: Native ptrace & syscall execution validated on host SELinux domain."))
             emit(ProbeEvent.Completed(true, "PASSED", true))
         } else {
-            val badge = failureReason ?: "FAILED: UNKNOWN"
+            val badge = processResult.failureBadge
             emit(ProbeEvent.Log("FAILURE: $badge"))
             emit(ProbeEvent.Completed(false, badge, false))
         }
     }.flowOn(Dispatchers.IO)
 
-    internal data class TestCase(val name: String, val command: List<String>)
+    internal data class TestCase(
+        val name: String,
+        val command: List<String>,
+        val env: Map<String, String> = emptyMap()
+    )
 
     internal data class ProcessOutput(val exitCode: Int, val failureBadge: String)
 
     companion object {
         internal suspend fun executeSubprocessSuspend(
             command: List<String>,
+            env: Map<String, String> = emptyMap(),
             onLine: suspend (String) -> Unit
         ): ProcessOutput {
             return try {
                 val pb = ProcessBuilder(command)
                 pb.redirectErrorStream(true)
+                if (env.isNotEmpty()) {
+                    pb.environment().putAll(env)
+                }
                 val process = pb.start()
 
                 BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
@@ -145,13 +126,18 @@ class SyscallProbeRunner(private val context: Context) {
             }
         }
 
+        @JvmOverloads
         internal fun executeSubprocess(
             command: List<String>,
+            env: Map<String, String> = emptyMap(),
             onLine: (String) -> Unit
         ): ProcessOutput {
             return try {
                 val pb = ProcessBuilder(command)
                 pb.redirectErrorStream(true)
+                if (env.isNotEmpty()) {
+                    pb.environment().putAll(env)
+                }
                 val process = pb.start()
 
                 BufferedReader(InputStreamReader(process.inputStream)).use { reader ->

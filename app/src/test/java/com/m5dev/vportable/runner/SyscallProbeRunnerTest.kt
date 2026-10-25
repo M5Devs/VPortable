@@ -8,7 +8,7 @@ class SyscallProbeRunnerTest {
     @Test
     fun testExecuteSubprocess_successfulCommand() {
         val lines = mutableListOf<String>()
-        val result = SyscallProbeRunner.executeSubprocess(listOf("echo", "Hello Gate 1")) { line ->
+        val result = SyscallProbeRunner.executeSubprocess(listOf("echo", "Hello Gate 1"), emptyMap()) { line ->
             lines.add(line)
         }
         assertEquals(0, result.exitCode)
@@ -20,7 +20,7 @@ class SyscallProbeRunnerTest {
     @Test
     fun testExecuteSubprocess_nonExistentCommand() {
         val lines = mutableListOf<String>()
-        val result = SyscallProbeRunner.executeSubprocess(listOf("/invalid_path/non_existent_binary")) { line ->
+        val result = SyscallProbeRunner.executeSubprocess(listOf("/invalid_path/non_existent_binary"), emptyMap()) { line ->
             lines.add(line)
         }
         assertEquals(-1, result.exitCode)
