@@ -151,7 +151,7 @@ class SyscallProbeRunner(private val context: Context) {
 
         val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
             emit(ProbeEvent.Log("  $logLine"))
-            if (logLine.contains("vportable-node1")) {
+            if (logLine.contains("vportable-node1") || logLine.contains("GATE_3_2_RESULT: CWD_ROOTFS_SUCCESS")) {
                 shellSuccessOutput = true
             }
             val pidMatch = Regex("""PID[= ](\d+)""").find(logLine)
@@ -200,6 +200,17 @@ class SyscallProbeRunner(private val context: Context) {
     internal data class ProcessOutput(val exitCode: Int, val failureBadge: String)
 
     companion object {
+        @JvmStatic
+        internal fun executeSubprocess(
+            command: List<String>,
+            env: Map<String, String> = emptyMap(),
+            onLine: (String) -> Unit
+        ): ProcessOutput {
+            return kotlinx.coroutines.runBlocking {
+                executeSubprocessSuspend(command, env) { line -> onLine(line) }
+            }
+        }
+
         internal suspend fun executeSubprocessSuspend(
             command: List<String>,
             env: Map<String, String> = emptyMap(),

@@ -306,9 +306,12 @@ int main(int argc, char *argv[]) {
         int fd = syscall(__NR_openat, AT_FDCWD, "/bin/sh", O_RDONLY, 0);
         if (fd >= 0) close(fd);
 
+        setvbuf(stdout, NULL, _IONBF, 0);
+        setvbuf(stderr, NULL, _IONBF, 0);
+
         // Gate 3.2 CWD Test: cd /etc && cat hostname
-        char *exec_args[] = { "sh", "-c", "cd /etc && cat hostname", NULL };
-        printf("CHILD: Invoking: /bin/sh -c \"cd /etc && cat hostname\"...\n");
+        char *exec_args[] = { "sh", "-c", "cd /etc && cat hostname && echo VPORTABLE_CWD_VERIFIED", NULL };
+        printf("CHILD: Invoking: /bin/sh -c \"cd /etc && cat hostname && echo VPORTABLE_CWD_VERIFIED\"...\n");
         fflush(stdout);
 
         execve("/bin/sh", exec_args, environ);
