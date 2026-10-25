@@ -480,7 +480,18 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     }
-                } else if (sig != SIGTRAP && sig != SIGSTOP) {
+                } else if (sig == SIGTRAP) {
+                    // Exec-stop! execve has successfully loaded libbusybox.so!
+                    // Detach from child so busybox runs cleanly without register interference:
+                    ptrace(PTRACE_DETACH, child, NULL, NULL);
+
+                    // Wait for busybox to complete its shell execution:
+                    waitpid(child, &status, 0);
+                    if (WIFEXITED(status)) {
+                        return WEXITSTATUS(status);
+                    }
+                    return 0;
+                } else if (sig != SIGSTOP) {
                     next_sig = sig;
                 }
             }
