@@ -89,4 +89,34 @@ class SyscallProbeRunnerTest {
         val binSh = java.io.File(rootfsDir, "bin/sh")
         assertTrue(binSh.exists())
     }
+
+    @Test
+    fun testRunGate3_1Probe_missingNativeBinary() = runTest {
+        val filesDir = tempFolder.newFolder("files")
+        val nativeDir = tempFolder.newFolder("lib")
+
+        val appInfo = ApplicationInfo().apply {
+            nativeLibraryDir = nativeDir.absolutePath
+        }
+
+        val mockContext = mock<Context>()
+        whenever(mockContext.filesDir).thenReturn(filesDir)
+        whenever(mockContext.applicationInfo).thenReturn(appInfo)
+
+        val runner = SyscallProbeRunner(mockContext)
+        val events = runner.runGate3_1Probe().toList()
+
+        val completedEvent = events.last() as ProbeEvent.Completed
+        assertFalse(completedEvent.success)
+        assertEquals("FAILED: ENOENT", completedEvent.badgeText)
+
+        val rootfsDir = java.io.File(filesDir, "rootfs")
+        val binSh = java.io.File(rootfsDir, "bin/sh")
+        val binCat = java.io.File(rootfsDir, "bin/cat")
+        val etcDir = java.io.File(rootfsDir, "etc")
+
+        assertTrue(binSh.exists())
+        assertTrue(binCat.exists())
+        assertTrue(etcDir.exists())
+    }
 }

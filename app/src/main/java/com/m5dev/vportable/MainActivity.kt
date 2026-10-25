@@ -74,7 +74,7 @@ fun Gate1TestHarnessScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(
-            text = "VPortable Gate 2 Test Harness",
+            text = "VPortable Gate 3.1 Test Harness",
             style = MaterialTheme.typography.titleLarge.copy(
                 fontWeight = FontWeight.Bold,
                 color = Color.White
@@ -120,7 +120,7 @@ fun Gate1TestHarnessScreen(
                         strokeWidth = 2.dp
                     )
                 }
-                Text("Run Gate 2 Syscall Test", color = Color.White)
+                Text("Run Gate 3.1 Syscall Test", color = Color.White)
             }
 
             state.badgeText?.let { badge ->
@@ -164,7 +164,7 @@ fun Gate1TestHarnessScreen(
         ) {
             if (state.logs.isEmpty()) {
                 Text(
-                    text = "Tap 'Run Gate 2 Syscall Test' to start VFS interception probe...",
+                    text = "Tap 'Run Gate 3.1 Syscall Test' to start VFS interception probe...",
                     color = Color.Gray,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.sp

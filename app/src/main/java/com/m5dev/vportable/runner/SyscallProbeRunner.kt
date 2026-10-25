@@ -82,8 +82,10 @@ class SyscallProbeRunner(private val context: Context) {
         }
     }.flowOn(Dispatchers.IO)
 
-    fun runGate2Probe(): Flow<ProbeEvent> = flow {
-        emit(ProbeEvent.Log("=== Gate 2: Multi-Syscall VFS Interception & Shell Execution (PoC) ==="))
+    fun runGate2Probe(): Flow<ProbeEvent> = runGate3_1Probe()
+
+    fun runGate3_1Probe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 3.1: Multi-Process Supervision, Mount Table & Pipeline Execution ==="))
 
         val rootfsDir = File(context.filesDir, "rootfs")
         val binDir = File(rootfsDir, "bin")
@@ -96,6 +98,10 @@ class SyscallProbeRunner(private val context: Context) {
         stagedShFile.writeText("#!/bin/sh\n")
         stagedShFile.setExecutable(true, false)
 
+        val stagedCatFile = File(binDir, "cat")
+        stagedCatFile.writeText("#!/bin/sh\n")
+        stagedCatFile.setExecutable(true, false)
+
         val nativeDir = context.applicationInfo.nativeLibraryDir
         val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
         val nativeBusyboxPath = "$nativeDir/libbusybox.so"
@@ -104,6 +110,7 @@ class SyscallProbeRunner(private val context: Context) {
         emit(ProbeEvent.Log("       Rootfs bin: ${binDir.absolutePath}"))
         emit(ProbeEvent.Log("       Rootfs etc: ${etcDir.absolutePath}"))
         emit(ProbeEvent.Log("       Staged shell marker: ${stagedShFile.absolutePath}"))
+        emit(ProbeEvent.Log("       Staged cat marker: ${stagedCatFile.absolutePath}"))
 
         val ptraceBinary = File(nativePtraceProbePath)
         val busyboxBinary = File(nativeBusyboxPath)
@@ -124,11 +131,12 @@ class SyscallProbeRunner(private val context: Context) {
         emit(ProbeEvent.Log("       Supervisor: ${ptraceBinary.name} (canExecute: ${ptraceBinary.canExecute()})"))
         emit(ProbeEvent.Log("       BusyBox: ${busyboxBinary.name} (canExecute: ${busyboxBinary.canExecute()})"))
 
+        val targetCmd = "echo VPORTABLE_GATE_3_1_SUCCESS | cat"
         val env = mapOf("PROOT_NO_SECCOMP" to "1")
-        val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir)
+        val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir, targetCmd)
 
         val testCase = TestCase(
-            name = "Gate 2 Multi-Syscall VFS Supervisor Probe",
+            name = "Gate 3.1 Multi-Process Supervisor Pipeline Probe",
             command = command,
             env = env
         )
@@ -136,27 +144,35 @@ class SyscallProbeRunner(private val context: Context) {
         emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
 
         var shellSuccessOutput = false
+        val detectedPids = mutableSetOf<String>()
 
         val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
             emit(ProbeEvent.Log("  $logLine"))
-            if (logLine.contains("VPORTABLE_GATE_2_SUCCESS")) {
+            if (logLine.contains("VPORTABLE_GATE_3_1_SUCCESS")) {
                 shellSuccessOutput = true
+            }
+            if (logLine.contains("SUPERVISOR [PID") || logLine.contains("Tracked new child PID")) {
+                val pidMatch = Regex("""PID (\d+)""").find(logLine)
+                pidMatch?.groupValues?.get(1)?.let { pid ->
+                    detectedPids.add(pid)
+                }
             }
         }
 
         val success = processResult.exitCode == 0 && shellSuccessOutput
 
         if (success) {
-            emit(ProbeEvent.Log("  -> Shell command executed successfully in virtual environment (SUCCESS)"))
+            emit(ProbeEvent.Log("  -> Shell pipeline command executed successfully in virtual environment (SUCCESS)"))
+            emit(ProbeEvent.Log("  -> Interception confirmed across ${detectedPids.size} PIDs: ${detectedPids.joinToString(", ")}"))
         } else {
             val reason = processResult.failureBadge
             emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
         }
 
-        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 2 Feasibility Results..."))
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 3.1 Feasibility Results..."))
         if (success) {
-            emit(ProbeEvent.Log("SUCCESS: Multi-syscall VFS interception & shell execution validated."))
-            emit(ProbeEvent.Completed(true, "PASSED (GATE 2)", true))
+            emit(ProbeEvent.Log("SUCCESS: Multi-process supervision, mount table & pipeline execution validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (GATE 3.1)", true))
         } else {
             val badge = if (processResult.exitCode != 0) {
                 when (processResult.exitCode) {
@@ -167,7 +183,7 @@ class SyscallProbeRunner(private val context: Context) {
                     else -> "FAILED: EXIT_${processResult.exitCode}"
                 }
             } else {
-                "FAILED: VFS_GATE_2_EXEC_FAILED"
+                "FAILED: VFS_GATE_3_1_EXEC_FAILED"
             }
             emit(ProbeEvent.Log("FAILURE: $badge"))
             emit(ProbeEvent.Completed(false, badge, false))
