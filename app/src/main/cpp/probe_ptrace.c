@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/uio.h>
@@ -204,7 +205,7 @@ typedef struct {
     char host_target[1024];
 } mount_entry_t;
 
-static mount_entry_t mount_table[3];
+static mount_entry_t mount_table[4];
 
 static void init_mount_table(const char *rootfs_dir) {
     mount_table[0].guest_prefix = "/bin";
@@ -215,10 +216,13 @@ static void init_mount_table(const char *rootfs_dir) {
 
     mount_table[2].guest_prefix = "/system";
     snprintf(mount_table[2].host_target, sizeof(mount_table[2].host_target), "%s/system", rootfs_dir);
+
+    mount_table[3].guest_prefix = "/lib";
+    snprintf(mount_table[3].host_target, sizeof(mount_table[3].host_target), "%s/lib", rootfs_dir);
 }
 
 static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         size_t plen = strlen(mount_table[i].guest_prefix);
         if (strncmp(in_path, mount_table[i].guest_prefix, plen) == 0) {
             if (in_path[plen] == '/' || in_path[plen] == '\0') {
@@ -255,20 +259,28 @@ static int set_child_regs(pid_t child, arch_regs_t *regs) {
     return ptrace(PTRACE_SETREGSET, child, (void*)(uintptr_t)NT_PRSTATUS, &iov);
 }
 
-static uintptr_t write_to_child_scratch(pid_t child, uintptr_t sp, const void *data, size_t len) {
-    uintptr_t scratch_addr = (sp - 2048) & ~15UL;
-    struct iovec local_iov = { .iov_base = (void*)data, .iov_len = len };
+static uintptr_t write_to_child_scratch(pid_t child, uintptr_t sp, const char *str, size_t len) {
+    uintptr_t scratch_addr = sp - 2048;
+    struct iovec local_iov = { .iov_base = (void*)str, .iov_len = len };
     struct iovec remote_iov = { .iov_base = (void*)scratch_addr, .iov_len = len };
-    if (process_vm_writev(child, &local_iov, 1, &remote_iov, 1, 0) != (ssize_t)len) return 0;
-    return scratch_addr;
+
+    if (process_vm_writev(child, &local_iov, 1, &remote_iov, 1, 0) == (ssize_t)len) {
+        return scratch_addr;
+    }
+    return 0;
 }
 
-static void ensure_argv0(pid_t child, uintptr_t argv_ptr, uintptr_t scratch_sp, const char *applet) {
-    if (argv_ptr == 0 || applet == NULL) return;
-    uintptr_t sh_addr = scratch_sp + 512;
-    size_t alen = strlen(applet) + 1;
-    struct iovec sh_l = { .iov_base = (void*)applet, .iov_len = alen };
+static void ensure_argv0(pid_t child, uintptr_t argv_ptr, uintptr_t sh_addr, const char *applet_name) {
+    if (argv_ptr == 0) return;
+    uintptr_t orig_argv0 = 0;
+    struct iovec r_l = { .iov_base = &orig_argv0, .iov_len = sizeof(orig_argv0) };
+    struct iovec r_r = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(orig_argv0) };
+    if (process_vm_readv(child, &r_l, 1, &r_r, 1, 0) <= 0 || orig_argv0 == 0) return;
+
+    size_t alen = strlen(applet_name) + 1;
+    struct iovec sh_l = { .iov_base = (void*)applet_name, .iov_len = alen };
     struct iovec sh_r = { .iov_base = (void*)sh_addr, .iov_len = alen };
+
     if (process_vm_writev(child, &sh_l, 1, &sh_r, 1, 0) == (ssize_t)alen) {
 #if defined(__x86_64__) || defined(__aarch64__)
         uint64_t new_ptr = (uint64_t)sh_addr;
@@ -300,22 +312,29 @@ int main(int argc, char *argv[]) {
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) exit(1);
         raise(SIGSTOP);
 
-        // Pre-checks
-        struct stat st;
-        syscall(__NR_newfstatat, AT_FDCWD, "/bin/sh", &st, 0);
-        int fd = syscall(__NR_openat, AT_FDCWD, "/bin/sh", O_RDONLY, 0);
-        if (fd >= 0) close(fd);
-
         setvbuf(stdout, NULL, _IONBF, 0);
         setvbuf(stderr, NULL, _IONBF, 0);
 
-        // Gate 3.2 CWD Test: cd /etc && cat hostname
-        char *exec_args[] = { "sh", "-c", "cd /etc && cat hostname && echo VPORTABLE_CWD_VERIFIED", NULL };
-        printf("CHILD: Invoking: /bin/sh -c \"cd /etc && cat hostname && echo VPORTABLE_CWD_VERIFIED\"...\n");
-        fflush(stdout);
+        // Child executes dynamic library loading test
+        void *handle = dlopen("/lib/libvfs_shared.so", RTLD_NOW);
+        if (!handle) {
+            fprintf(stderr, "CHILD_DLOPEN_FAILED: %s\n", dlerror());
+            exit(1);
+        }
 
-        execve("/bin/sh", exec_args, environ);
-        exit(1);
+        typedef const char* (*marker_fn_t)(void);
+        marker_fn_t get_marker = (marker_fn_t)dlsym(handle, "vfs_get_dynamic_marker");
+        if (!get_marker) {
+            fprintf(stderr, "CHILD_DLSYM_FAILED: %s\n", dlerror());
+            dlclose(handle);
+            exit(1);
+        }
+
+        printf("CHILD_DYNAMIC_LOAD: %s\n", get_marker());
+        printf("GATE_4_RESULT: DYNAMIC_VFS_SUCCESS\n");
+        fflush(stdout);
+        dlclose(handle);
+        exit(0);
     }
 
     // Supervisor Process
@@ -413,6 +432,9 @@ int main(int argc, char *argv[]) {
                                         if (scr != 0) {
                                             SET_ARCH_ARG2(regs, scr);
                                             set_child_regs(cur_pid, &regs);
+                                            printf("SUPERVISOR [PID=%d]: Redirected openat %s -> %s\n",
+                                                   cur_pid, full_virtual, rew_path);
+                                            fflush(stdout);
                                         }
                                     }
                                 }
@@ -472,7 +494,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("GATE_3_2_RESULT: CWD_ROOTFS_SUCCESS\n");
+    printf("GATE_4_RESULT: DYNAMIC_VFS_SUCCESS\n");
     fflush(stdout);
     return 0;
 }
