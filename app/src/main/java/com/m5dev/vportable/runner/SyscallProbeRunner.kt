@@ -82,6 +82,98 @@ class SyscallProbeRunner(private val context: Context) {
         }
     }.flowOn(Dispatchers.IO)
 
+    fun runGate2Probe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 2: Multi-Syscall VFS Interception & Shell Execution (PoC) ==="))
+
+        val rootfsDir = File(context.filesDir, "rootfs")
+        val binDir = File(rootfsDir, "bin")
+        val etcDir = File(rootfsDir, "etc")
+
+        binDir.mkdirs()
+        etcDir.mkdirs()
+
+        val stagedShFile = File(binDir, "sh")
+        stagedShFile.writeText("#!/bin/sh\n")
+        stagedShFile.setExecutable(true, false)
+
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
+        val nativeBusyboxPath = "$nativeDir/libbusybox.so"
+
+        emit(ProbeEvent.Log("[1/4] Staging virtual rootfs structure in ${rootfsDir.absolutePath}..."))
+        emit(ProbeEvent.Log("       Rootfs bin: ${binDir.absolutePath}"))
+        emit(ProbeEvent.Log("       Rootfs etc: ${etcDir.absolutePath}"))
+        emit(ProbeEvent.Log("       Staged shell marker: ${stagedShFile.absolutePath}"))
+
+        val ptraceBinary = File(nativePtraceProbePath)
+        val busyboxBinary = File(nativeBusyboxPath)
+
+        if (!ptraceBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: Native supervisor missing in $nativeDir ($nativePtraceProbePath)"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        if (!busyboxBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: Native busybox library missing in $nativeDir ($nativeBusyboxPath)"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        emit(ProbeEvent.Log("[2/4] Native binaries verified at $nativeDir"))
+        emit(ProbeEvent.Log("       Supervisor: ${ptraceBinary.name} (canExecute: ${ptraceBinary.canExecute()})"))
+        emit(ProbeEvent.Log("       BusyBox: ${busyboxBinary.name} (canExecute: ${busyboxBinary.canExecute()})"))
+
+        val env = mapOf("PROOT_NO_SECCOMP" to "1")
+        val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir)
+
+        val testCase = TestCase(
+            name = "Gate 2 Multi-Syscall VFS Supervisor Probe",
+            command = command,
+            env = env
+        )
+
+        emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
+
+        var shellSuccessOutput = false
+
+        val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
+            emit(ProbeEvent.Log("  $logLine"))
+            if (logLine.contains("VPORTABLE_GATE_2_SUCCESS")) {
+                shellSuccessOutput = true
+            }
+        }
+
+        val success = processResult.exitCode == 0 && shellSuccessOutput
+
+        if (success) {
+            emit(ProbeEvent.Log("  -> Shell command executed successfully in virtual environment (SUCCESS)"))
+        } else {
+            val reason = processResult.failureBadge
+            emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
+        }
+
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 2 Feasibility Results..."))
+        if (success) {
+            emit(ProbeEvent.Log("SUCCESS: Multi-syscall VFS interception & shell execution validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (GATE 2)", true))
+        } else {
+            val badge = if (processResult.exitCode != 0) {
+                when (processResult.exitCode) {
+                    126 -> "FAILED: EPERM"
+                    127 -> "FAILED: ENOENT"
+                    139 -> "FAILED: SIGSEGV"
+                    159 -> "FAILED: SIGSYS"
+                    else -> "FAILED: EXIT_${processResult.exitCode}"
+                }
+            } else {
+                "FAILED: VFS_GATE_2_EXEC_FAILED"
+            }
+            emit(ProbeEvent.Log("FAILURE: $badge"))
+            emit(ProbeEvent.Completed(false, badge, false))
+        }
+    }.flowOn(Dispatchers.IO)
+
     internal data class TestCase(
         val name: String,
         val command: List<String>,
@@ -113,7 +205,7 @@ class SyscallProbeRunner(private val context: Context) {
 
                 val exitCode = process.waitFor()
                 val badge = when (exitCode) {
-                    0 -> "PASSED (GATE 1.5)"
+                    0 -> "PASSED"
                     126 -> "FAILED: EPERM"
                     127 -> "FAILED: ENOENT"
                     139 -> "FAILED: SIGSEGV"
