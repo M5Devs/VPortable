@@ -30,8 +30,48 @@
 #define PTRACE_SETOPTIONS 0x4200
 #endif
 
+#ifndef PTRACE_GETEVENTMSG
+#define PTRACE_GETEVENTMSG 0x4201
+#endif
+
 #ifndef PTRACE_O_TRACESYSGOOD
 #define PTRACE_O_TRACESYSGOOD 0x00000001
+#endif
+
+#ifndef PTRACE_O_TRACEFORK
+#define PTRACE_O_TRACEFORK 0x00000002
+#endif
+
+#ifndef PTRACE_O_TRACEVFORK
+#define PTRACE_O_TRACEVFORK 0x00000004
+#endif
+
+#ifndef PTRACE_O_TRACECLONE
+#define PTRACE_O_TRACECLONE 0x00000008
+#endif
+
+#ifndef PTRACE_O_TRACEEXEC
+#define PTRACE_O_TRACEEXEC 0x00000010
+#endif
+
+#ifndef PTRACE_EVENT_FORK
+#define PTRACE_EVENT_FORK 1
+#endif
+
+#ifndef PTRACE_EVENT_VFORK
+#define PTRACE_EVENT_VFORK 2
+#endif
+
+#ifndef PTRACE_EVENT_CLONE
+#define PTRACE_EVENT_CLONE 3
+#endif
+
+#ifndef PTRACE_EVENT_EXEC
+#define PTRACE_EVENT_EXEC 4
+#endif
+
+#ifndef __WALL
+#define __WALL 0x40000000
 #endif
 
 #ifndef AT_FDCWD
@@ -75,8 +115,94 @@
 #endif
 
 #define FAKE_PATH "/system/vportable_fake_entry.txt"
+#define MAX_TRACKED_PIDS 64
 
 extern char **environ;
+
+typedef struct {
+    pid_t pid;
+    int in_syscall;
+    long last_syscall;
+    int is_active;
+} pid_state_t;
+
+static pid_state_t pid_table[MAX_TRACKED_PIDS];
+
+static pid_state_t* find_or_create_pid_state(pid_t pid) {
+    for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
+        if (pid_table[i].is_active && pid_table[i].pid == pid) {
+            return &pid_table[i];
+        }
+    }
+    for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
+        if (!pid_table[i].is_active) {
+            pid_table[i].pid = pid;
+            pid_table[i].in_syscall = 0;
+            pid_table[i].last_syscall = -1;
+            pid_table[i].is_active = 1;
+            return &pid_table[i];
+        }
+    }
+    return NULL;
+}
+
+static void remove_pid_state(pid_t pid) {
+    for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
+        if (pid_table[i].is_active && pid_table[i].pid == pid) {
+            pid_table[i].is_active = 0;
+            break;
+        }
+    }
+}
+
+static int get_active_pid_count(void) {
+    int count = 0;
+    for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
+        if (pid_table[i].is_active) {
+            count++;
+        }
+    }
+    return count;
+}
+
+typedef struct {
+    const char *guest_prefix;
+    char host_target[1024];
+} mount_entry_t;
+
+static mount_entry_t mount_table[] = {
+    { "/bin", "" },
+    { "/etc", "" },
+    { "/system", "" }
+};
+#define NUM_MOUNT_ENTRIES (sizeof(mount_table) / sizeof(mount_table[0]))
+
+static void init_mount_table_targets(const char *rootfs_dir) {
+    for (size_t i = 0; i < NUM_MOUNT_ENTRIES; i++) {
+        snprintf(mount_table[i].host_target, sizeof(mount_table[i].host_target),
+                 "%s%s", rootfs_dir, mount_table[i].guest_prefix);
+    }
+}
+
+static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
+    if (in_path == NULL || out_path == NULL) return 0;
+
+    for (size_t i = 0; i < NUM_MOUNT_ENTRIES; i++) {
+        if (mount_table[i].host_target[0] == '\0') continue;
+
+        const char *gprefix = mount_table[i].guest_prefix;
+        size_t gprefix_len = strlen(gprefix);
+
+        if (strcmp(in_path, gprefix) == 0) {
+            snprintf(out_path, out_size, "%s", mount_table[i].host_target);
+            return 1;
+        } else if (strncmp(in_path, gprefix, gprefix_len) == 0 && in_path[gprefix_len] == '/') {
+            snprintf(out_path, out_size, "%s%s", mount_table[i].host_target, in_path + gprefix_len);
+            return 1;
+        }
+    }
+    return 0;
+}
 
 #if defined(__x86_64__)
 typedef struct user_regs_struct arch_regs_t;
@@ -161,54 +287,31 @@ static uintptr_t write_to_child_scratch(pid_t child, uintptr_t sp, const void *d
     return scratch_addr;
 }
 
-static void ensure_argv0_is_sh(pid_t child, uintptr_t argv_ptr, uintptr_t scratch_sp) {
-    if (argv_ptr == 0) return;
+static void ensure_argv0_is_applet(pid_t child, uintptr_t argv_ptr, uintptr_t scratch_sp, const char *applet) {
+    if (argv_ptr == 0 || applet == NULL) return;
 
-    uintptr_t argv0_addr = 0;
+    uintptr_t applet_addr = scratch_sp + 512;
+    size_t applet_len = strlen(applet) + 1;
+    struct iovec applet_l = { .iov_base = (void*)applet, .iov_len = applet_len };
+    struct iovec applet_r = { .iov_base = (void*)applet_addr, .iov_len = applet_len };
+    if (process_vm_writev(child, &applet_l, 1, &applet_r, 1, 0) == (ssize_t)applet_len) {
 #if defined(__x86_64__) || defined(__aarch64__)
-    uint64_t ptr_val = 0;
-    struct iovec l_iov = { .iov_base = &ptr_val, .iov_len = sizeof(ptr_val) };
-    struct iovec r_iov = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(ptr_val) };
-    if (process_vm_readv(child, &l_iov, 1, &r_iov, 1, 0) != sizeof(ptr_val)) return;
-    argv0_addr = (uintptr_t)ptr_val;
+        uint64_t new_ptr = (uint64_t)applet_addr;
+        struct iovec w_l = { .iov_base = &new_ptr, .iov_len = sizeof(new_ptr) };
+        struct iovec w_r = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(new_ptr) };
+        process_vm_writev(child, &w_l, 1, &w_r, 1, 0);
 #else
-    uint32_t ptr_val = 0;
-    struct iovec l_iov = { .iov_base = &ptr_val, .iov_len = sizeof(ptr_val) };
-    struct iovec r_iov = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(ptr_val) };
-    if (process_vm_readv(child, &l_iov, 1, &r_iov, 1, 0) != sizeof(ptr_val)) return;
-    argv0_addr = (uintptr_t)ptr_val;
+        uint32_t new_ptr = (uint32_t)applet_addr;
+        struct iovec w_l = { .iov_base = &new_ptr, .iov_len = sizeof(new_ptr) };
+        struct iovec w_r = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(new_ptr) };
+        process_vm_writev(child, &w_l, 1, &w_r, 1, 0);
 #endif
-
-    char argv0_buf[64] = {0};
-    if (argv0_addr != 0) {
-        struct iovec str_l = { .iov_base = argv0_buf, .iov_len = sizeof(argv0_buf) - 1 };
-        struct iovec str_r = { .iov_base = (void*)argv0_addr, .iov_len = sizeof(argv0_buf) - 1 };
-        process_vm_readv(child, &str_l, 1, &str_r, 1, 0);
-    }
-
-    if (strcmp(argv0_buf, "sh") != 0) {
-        uintptr_t sh_addr = scratch_sp + 512;
-        struct iovec sh_l = { .iov_base = "sh", .iov_len = 3 };
-        struct iovec sh_r = { .iov_base = (void*)sh_addr, .iov_len = 3 };
-        if (process_vm_writev(child, &sh_l, 1, &sh_r, 1, 0) == 3) {
-#if defined(__x86_64__) || defined(__aarch64__)
-            uint64_t new_ptr = (uint64_t)sh_addr;
-            struct iovec w_l = { .iov_base = &new_ptr, .iov_len = sizeof(new_ptr) };
-            struct iovec w_r = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(new_ptr) };
-            process_vm_writev(child, &w_l, 1, &w_r, 1, 0);
-#else
-            uint32_t new_ptr = (uint32_t)sh_addr;
-            struct iovec w_l = { .iov_base = &new_ptr, .iov_len = sizeof(new_ptr) };
-            struct iovec w_r = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(new_ptr) };
-            process_vm_writev(child, &w_l, 1, &w_r, 1, 0);
-#endif
-        }
     }
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2 || argv[1] == NULL || argv[1][0] == '\0') {
-        fprintf(stderr, "USAGE: %s <rootfs_base_path/target_file_path> [native_lib_dir]\n", argv[0]);
+        fprintf(stderr, "USAGE: %s <rootfs_base_path/target_file_path> [native_lib_dir] [cmd]\n", argv[0]);
         return 1;
     }
 
@@ -263,7 +366,7 @@ int main(int argc, char *argv[]) {
                 exit(1);
             }
         } else {
-            // Gate 2 test sequence: fstatat, openat, execve
+            // Multi-process / pipeline test
             struct stat st;
             int fstat_res = syscall(__NR_newfstatat, AT_FDCWD, "/bin/sh", &st, 0);
             printf("CHILD: fstatat(\"/bin/sh\") res=%d\n", fstat_res);
@@ -276,8 +379,13 @@ int main(int argc, char *argv[]) {
                 close(fd);
             }
 
-            char *exec_args[] = { "sh", "-c", "echo VPORTABLE_GATE_2_SUCCESS", NULL };
-            printf("CHILD: Invoking /bin/sh -c \"echo VPORTABLE_GATE_2_SUCCESS\"...\n");
+            const char *cmd = "echo VPORTABLE_GATE_3_1_SUCCESS | cat";
+            if (argc >= 4 && argv[3] != NULL && argv[3][0] != '\0') {
+                cmd = argv[3];
+            }
+
+            char *exec_args[] = { "sh", "-c", (char*)cmd, NULL };
+            printf("CHILD: Invoking /bin/sh -c \"%s\"...\n", cmd);
             fflush(stdout);
 
             execve("/bin/sh", exec_args, environ);
@@ -290,8 +398,16 @@ int main(int argc, char *argv[]) {
         }
     } else {
         // Supervisor (Parent) Process
+        memset(pid_table, 0, sizeof(pid_table));
+        find_or_create_pid_state(child);
+
+        if (is_gate2) {
+            init_mount_table_targets(param1);
+        }
+
         int status;
-        if (waitpid(child, &status, 0) < 0) {
+        pid_t initial_pid = waitpid(child, &status, __WALL);
+        if (initial_pid < 0) {
             perror("waitpid initial");
             return 1;
         }
@@ -301,46 +417,76 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        if (ptrace(PTRACE_SETOPTIONS, child, NULL, (void*)(uintptr_t)PTRACE_O_TRACESYSGOOD) < 0) {
+        if (ptrace(PTRACE_SETOPTIONS, child, NULL,
+                   (void*)(uintptr_t)(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
+                                      PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
+                                      PTRACE_O_TRACEEXEC)) < 0) {
             perror("ptrace SETOPTIONS");
             return 1;
         }
 
-        int in_syscall = 0;
-        long last_syscall = -1;
-        int next_sig = 0;
-
-        while (1) {
-            if (ptrace(PTRACE_SYSCALL, child, NULL, (void*)(uintptr_t)next_sig) < 0) {
-                if (errno == ESRCH) {
+        while (get_active_pid_count() > 0) {
+            pid_t current_pid = waitpid(-1, &status, __WALL);
+            if (current_pid < 0) {
+                if (errno == ECHILD) {
                     break;
                 }
-                perror("ptrace SYSCALL");
-                return 1;
-            }
-            next_sig = 0;
-
-            if (waitpid(child, &status, 0) < 0) {
                 perror("waitpid loop");
                 return 1;
             }
 
-            if (WIFEXITED(status)) {
-                return WEXITSTATUS(status);
-            }
-            if (WIFSIGNALED(status)) {
-                return 1;
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                remove_pid_state(current_pid);
+                printf("SUPERVISOR: PID %d exited (status=%d)\n", current_pid,
+                       WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
+                fflush(stdout);
+                continue;
             }
 
             if (WIFSTOPPED(status)) {
                 int sig = WSTOPSIG(status);
+                int event = (status >> 16);
+                int next_sig = 0;
+
+                pid_state_t *st = find_or_create_pid_state(current_pid);
+                if (!st) {
+                    ptrace(PTRACE_SYSCALL, current_pid, NULL, NULL);
+                    continue;
+                }
+
+                if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
+                    unsigned long new_pid_val = 0;
+                    if (ptrace(PTRACE_GETEVENTMSG, current_pid, NULL, &new_pid_val) == 0 && new_pid_val > 0) {
+                        pid_t new_pid = (pid_t)new_pid_val;
+                        pid_state_t *new_st = find_or_create_pid_state(new_pid);
+                        if (new_st) {
+                            ptrace(PTRACE_SETOPTIONS, new_pid, NULL,
+                                   (void*)(uintptr_t)(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
+                                                      PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
+                                                      PTRACE_O_TRACEEXEC));
+                            printf("SUPERVISOR: Tracked new child PID %d (parent PID %d)\n", new_pid, current_pid);
+                            fflush(stdout);
+                        }
+                    }
+                    ptrace(PTRACE_SYSCALL, current_pid, NULL, NULL);
+                    continue;
+                }
+
+                if (event == PTRACE_EVENT_EXEC) {
+                    st->in_syscall = 0;
+                    printf("SUPERVISOR [PID %d]: Exec stop (PTRACE_EVENT_EXEC)\n", current_pid);
+                    fflush(stdout);
+                    ptrace(PTRACE_SYSCALL, current_pid, NULL, NULL);
+                    continue;
+                }
+
                 if (sig == (SIGTRAP | 0x80)) {
-                    if (!in_syscall) {
-                        in_syscall = 1;
+                    if (!st->in_syscall) {
+                        st->in_syscall = 1;
                         arch_regs_t regs;
-                        if (get_child_regs(child, &regs) == 0) {
+                        if (get_child_regs(current_pid, &regs) == 0) {
                             long syscall_nr = ARCH_SYSCALL_NR(regs);
-                            last_syscall = syscall_nr;
+                            st->last_syscall = syscall_nr;
                             uintptr_t sp = ARCH_SP(regs);
 
                             if (!is_gate2) {
@@ -349,32 +495,18 @@ int main(int argc, char *argv[]) {
                                     uintptr_t path_addr = ARCH_ARG2(regs);
                                     if (path_addr != 0) {
                                         char child_path[512] = {0};
-                                        struct iovec local_iov = {
-                                            .iov_base = child_path,
-                                            .iov_len = sizeof(child_path) - 1
-                                        };
-                                        struct iovec remote_iov = {
-                                            .iov_base = (void*)path_addr,
-                                            .iov_len = sizeof(child_path) - 1
-                                        };
+                                        struct iovec local_iov = { .iov_base = child_path, .iov_len = sizeof(child_path) - 1 };
+                                        struct iovec remote_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(child_path) - 1 };
 
-                                        ssize_t nread = process_vm_readv(child, &local_iov, 1, &remote_iov, 1, 0);
-                                        if (nread > 0) {
-                                            child_path[nread] = '\0';
+                                        if (process_vm_readv(current_pid, &local_iov, 1, &remote_iov, 1, 0) > 0) {
                                             if (strcmp(child_path, FAKE_PATH) == 0) {
                                                 size_t real_path_len = strlen(param1) + 1;
-                                                struct iovec w_local = {
-                                                    .iov_base = (void*)param1,
-                                                    .iov_len = real_path_len
-                                                };
-                                                struct iovec w_remote = {
-                                                    .iov_base = (void*)path_addr,
-                                                    .iov_len = real_path_len
-                                                };
+                                                struct iovec w_local = { .iov_base = (void*)param1, .iov_len = real_path_len };
+                                                struct iovec w_remote = { .iov_base = (void*)path_addr, .iov_len = real_path_len };
 
-                                                ssize_t nwritten = process_vm_writev(child, &w_local, 1, &w_remote, 1, 0);
-                                                if (nwritten == (ssize_t)real_path_len) {
-                                                    printf("SUPERVISOR: Intercepted %s -> Rewrote to %s\n", FAKE_PATH, param1);
+                                                if (process_vm_writev(current_pid, &w_local, 1, &w_remote, 1, 0) == (ssize_t)real_path_len) {
+                                                    printf("SUPERVISOR [PID %d]: Intercepted %s -> Rewrote to %s\n", current_pid, FAKE_PATH, param1);
+                                                    printf("GATE_1_5_RESULT: VFS_REWRITE_SUCCESS\n");
                                                     fflush(stdout);
                                                 }
                                             }
@@ -382,50 +514,24 @@ int main(int argc, char *argv[]) {
                                     }
                                 }
                             } else {
-                                // Gate 2 mode
-                                const char *rootfs_dir = param1;
-                                const char *native_lib_dir = param2;
-
+                                // Gate 2 / Gate 3.1 mode
                                 if (syscall_nr == __NR_openat || syscall_nr == __NR_newfstatat) {
                                     uintptr_t path_addr = ARCH_ARG2(regs);
                                     if (path_addr != 0) {
                                         char child_path[1024] = {0};
-                                        struct iovec local_iov = {
-                                            .iov_base = child_path,
-                                            .iov_len = sizeof(child_path) - 1
-                                        };
-                                        struct iovec remote_iov = {
-                                            .iov_base = (void*)path_addr,
-                                            .iov_len = sizeof(child_path) - 1
-                                        };
+                                        struct iovec local_iov = { .iov_base = child_path, .iov_len = sizeof(child_path) - 1 };
+                                        struct iovec remote_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(child_path) - 1 };
 
-                                        ssize_t nread = process_vm_readv(child, &local_iov, 1, &remote_iov, 1, 0);
-                                        if (nread > 0) {
-                                            child_path[nread] = '\0';
+                                        if (process_vm_readv(current_pid, &local_iov, 1, &remote_iov, 1, 0) > 0) {
                                             char rewritten_path[2048] = {0};
-                                            int should_rewrite = 0;
-
-                                            if (strncmp(child_path, "/bin/", 5) == 0) {
-                                                snprintf(rewritten_path, sizeof(rewritten_path), "%s/bin/%s", rootfs_dir, child_path + 5);
-                                                should_rewrite = 1;
-                                            } else if (strcmp(child_path, "/bin") == 0) {
-                                                snprintf(rewritten_path, sizeof(rewritten_path), "%s/bin", rootfs_dir);
-                                                should_rewrite = 1;
-                                            } else if (strncmp(child_path, "/system/", 8) == 0) {
-                                                snprintf(rewritten_path, sizeof(rewritten_path), "%s/system/%s", rootfs_dir, child_path + 8);
-                                                should_rewrite = 1;
-                                            } else if (strcmp(child_path, "/system") == 0) {
-                                                snprintf(rewritten_path, sizeof(rewritten_path), "%s/system", rootfs_dir);
-                                                should_rewrite = 1;
-                                            }
-
-                                            if (should_rewrite) {
+                                            if (resolve_vfs_path(child_path, rewritten_path, sizeof(rewritten_path))) {
                                                 size_t rew_len = strlen(rewritten_path) + 1;
-                                                uintptr_t scratch = write_to_child_scratch(child, sp, rewritten_path, rew_len);
+                                                uintptr_t scratch = write_to_child_scratch(current_pid, sp, rewritten_path, rew_len);
                                                 if (scratch != 0) {
                                                     SET_ARCH_ARG2(regs, scratch);
-                                                    set_child_regs(child, &regs);
-                                                    printf("SUPERVISOR: Intercepted %s path=%s -> Rewrote to %s\n",
+                                                    set_child_regs(current_pid, &regs);
+                                                    printf("SUPERVISOR [PID %d]: Intercepted %s path=%s -> Rewrote to %s\n",
+                                                           current_pid,
                                                            (syscall_nr == __NR_openat ? "openat" : "newfstatat"),
                                                            child_path, rewritten_path);
                                                     fflush(stdout);
@@ -437,30 +543,41 @@ int main(int argc, char *argv[]) {
                                     uintptr_t path_addr = ARCH_ARG1(regs);
                                     if (path_addr != 0) {
                                         char child_path[1024] = {0};
-                                        struct iovec local_iov = {
-                                            .iov_base = child_path,
-                                            .iov_len = sizeof(child_path) - 1
-                                        };
-                                        struct iovec remote_iov = {
-                                            .iov_base = (void*)path_addr,
-                                            .iov_len = sizeof(child_path) - 1
-                                        };
+                                        struct iovec local_iov = { .iov_base = child_path, .iov_len = sizeof(child_path) - 1 };
+                                        struct iovec remote_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(child_path) - 1 };
 
-                                        ssize_t nread = process_vm_readv(child, &local_iov, 1, &remote_iov, 1, 0);
-                                        if (nread > 0) {
-                                            child_path[nread] = '\0';
-                                            char busybox_path[2048] = {0};
-                                            snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", native_lib_dir);
-                                            size_t bb_len = strlen(busybox_path) + 1;
+                                        if (process_vm_readv(current_pid, &local_iov, 1, &remote_iov, 1, 0) > 0) {
+                                            char resolved_exec_path[2048] = {0};
+                                            int is_vfs_exec = 0;
+                                            char applet_name[256] = {0};
 
-                                            uintptr_t scratch = write_to_child_scratch(child, sp, busybox_path, bb_len);
-                                            if (scratch != 0) {
-                                                SET_ARCH_ARG1(regs, scratch);
-                                                ensure_argv0_is_sh(child, ARCH_ARG2(regs), scratch);
-                                                set_child_regs(child, &regs);
-                                                printf("SUPERVISOR: Intercepted execve path=%s -> Rewrote to %s (argv[0]=sh)\n",
-                                                       child_path, busybox_path);
-                                                fflush(stdout);
+                                            if (strncmp(child_path, "/bin/", 5) == 0) {
+                                                snprintf(applet_name, sizeof(applet_name), "%s", child_path + 5);
+                                                is_vfs_exec = 1;
+                                            } else if (resolve_vfs_path(child_path, resolved_exec_path, sizeof(resolved_exec_path))) {
+                                                const char *bname = strrchr(child_path, '/');
+                                                if (bname) {
+                                                    snprintf(applet_name, sizeof(applet_name), "%s", bname + 1);
+                                                } else {
+                                                    snprintf(applet_name, sizeof(applet_name), "%s", child_path);
+                                                }
+                                                is_vfs_exec = 1;
+                                            }
+
+                                            if (is_vfs_exec) {
+                                                char busybox_path[2048] = {0};
+                                                snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", param2);
+                                                size_t bb_len = strlen(busybox_path) + 1;
+
+                                                uintptr_t scratch = write_to_child_scratch(current_pid, sp, busybox_path, bb_len);
+                                                if (scratch != 0) {
+                                                    SET_ARCH_ARG1(regs, scratch);
+                                                    ensure_argv0_is_applet(current_pid, ARCH_ARG2(regs), scratch, applet_name);
+                                                    set_child_regs(current_pid, &regs);
+                                                    printf("SUPERVISOR [PID %d]: Intercepted execve path=%s -> Rewrote to %s (argv[0]=%s)\n",
+                                                           current_pid, child_path, busybox_path, applet_name);
+                                                    fflush(stdout);
+                                                }
                                             }
                                         }
                                     }
@@ -468,32 +585,32 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     } else {
-                        in_syscall = 0;
-                        if (is_gate2 && last_syscall == __NR_execve) {
+                        st->in_syscall = 0;
+                        if (is_gate2 && st->last_syscall == __NR_execve) {
                             arch_regs_t regs;
-                            if (get_child_regs(child, &regs) == 0) {
+                            if (get_child_regs(current_pid, &regs) == 0) {
                                 long ret = ARCH_RET(regs);
                                 if (ret < 0) {
-                                    printf("SUPERVISOR: execve returned error=%ld (%s)\n", -ret, strerror((int)-ret));
+                                    printf("SUPERVISOR [PID %d]: execve returned error=%ld (%s)\n",
+                                           current_pid, -ret, strerror((int)-ret));
                                     fflush(stdout);
                                 }
                             }
                         }
                     }
                 } else if (sig == SIGTRAP) {
-                    // Exec-stop! execve has successfully loaded libbusybox.so!
-                    // Detach from child so busybox runs cleanly without register interference:
-                    ptrace(PTRACE_DETACH, child, NULL, NULL);
-
-                    // Wait for busybox to complete its shell execution:
-                    waitpid(child, &status, 0);
-                    if (WIFEXITED(status)) {
-                        return WEXITSTATUS(status);
-                    }
-                    return 0;
-                } else if (sig != SIGSTOP) {
+                    st->in_syscall = 0;
+                } else if (sig == SIGSTOP) {
+                    ptrace(PTRACE_SETOPTIONS, current_pid, NULL,
+                           (void*)(uintptr_t)(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
+                                              PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
+                                              PTRACE_O_TRACEEXEC));
+                    next_sig = 0;
+                } else {
                     next_sig = sig;
                 }
+
+                ptrace(PTRACE_SYSCALL, current_pid, NULL, (void*)(uintptr_t)next_sig);
             }
         }
         return 0;
