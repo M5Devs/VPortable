@@ -16,13 +16,20 @@ sealed class ProbeEvent {
 
 class SyscallProbeRunner(private val context: Context) {
 
+    fun runGate1_5Probe(): Flow<ProbeEvent> = runGate1Probe()
+
     fun runGate1Probe(): Flow<ProbeEvent> = flow {
-        emit(ProbeEvent.Log("=== Gate 1: Minimal Native Ptrace & Syscall Feasibility Test ==="))
+        emit(ProbeEvent.Log("=== Gate 1.5: Ptrace Syscall Interception & Path Rewriting (VFS PoC) ==="))
+
+        val markerFile = File(context.filesDir, "vfs_marker.txt")
+        markerFile.writeText("VFS_INTERCEPTION_VALIDATED")
+        val targetPath = markerFile.absolutePath
 
         val nativeDir = context.applicationInfo.nativeLibraryDir
         val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
 
-        emit(ProbeEvent.Log("[1/4] Resolving native probe ($nativePtraceProbePath)..."))
+        emit(ProbeEvent.Log("[1/4] Preparing target test file and resolving native probe ($nativePtraceProbePath)..."))
+        emit(ProbeEvent.Log("       Target file: $targetPath"))
 
         val ptraceBinary = File(nativePtraceProbePath)
 
@@ -36,36 +43,40 @@ class SyscallProbeRunner(private val context: Context) {
         emit(ProbeEvent.Log("       ptrace probe: ${ptraceBinary.name} (executable: ${ptraceBinary.canExecute()})"))
 
         val testCase = TestCase(
-            name = "Native C Ptrace & Syscall Interception Probe (libprobe_ptrace.so)",
-            command = listOf(nativePtraceProbePath)
+            name = "Native C Ptrace Syscall Interception & VFS Path Rewriting Probe (libprobe_ptrace.so)",
+            command = listOf(nativePtraceProbePath, targetPath)
         )
 
         emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
 
-        var ptraceSuccessDetected = false
+        var rewriteSuccess = false
+        var childReadSuccess = false
 
         val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
             emit(ProbeEvent.Log("  $logLine"))
-            if (logLine.contains("GATE_1_RESULT: PTRACE_TRACEME_SUCCESS")) {
-                ptraceSuccessDetected = true
+            if (logLine.contains("GATE_1_5_RESULT: VFS_REWRITE_SUCCESS")) {
+                rewriteSuccess = true
+            }
+            if (logLine.contains("CHILD_READ: VFS_INTERCEPTION_VALIDATED")) {
+                childReadSuccess = true
             }
         }
 
-        val success = processResult.exitCode == 0 || ptraceSuccessDetected
+        val success = processResult.exitCode == 0 && rewriteSuccess && childReadSuccess
 
         if (success) {
-            emit(ProbeEvent.Log("  -> Subprocess exited successfully / ptrace validated (SUCCESS)"))
+            emit(ProbeEvent.Log("  -> Subprocess exited successfully / VFS path rewriting validated (SUCCESS)"))
         } else {
             val reason = processResult.failureBadge
             emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
         }
 
-        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 1 Feasibility Gate Results..."))
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 1.5 Feasibility Gate Results..."))
         if (success) {
-            emit(ProbeEvent.Log("SUCCESS: Native ptrace & syscall execution validated on host SELinux domain."))
-            emit(ProbeEvent.Completed(true, "PASSED", true))
+            emit(ProbeEvent.Log("SUCCESS: Syscall interception & path rewriting validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (GATE 1.5)", true))
         } else {
-            val badge = processResult.failureBadge
+            val badge = if (processResult.exitCode != 0) processResult.failureBadge else "FAILED: VFS_REWRITE_FAILED"
             emit(ProbeEvent.Log("FAILURE: $badge"))
             emit(ProbeEvent.Completed(false, badge, false))
         }
@@ -102,7 +113,7 @@ class SyscallProbeRunner(private val context: Context) {
 
                 val exitCode = process.waitFor()
                 val badge = when (exitCode) {
-                    0 -> "PASSED"
+                    0 -> "PASSED (GATE 1.5)"
                     126 -> "FAILED: EPERM"
                     127 -> "FAILED: ENOENT"
                     139 -> "FAILED: SIGSEGV"
