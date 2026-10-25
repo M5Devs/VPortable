@@ -82,6 +82,7 @@ extern char **environ;
 typedef struct user_regs_struct arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).rsp)
 #define ARCH_SYSCALL_NR(regs) ((long)(regs).orig_rax)
+#define ARCH_RET(regs) ((long)(regs).rax)
 #define ARCH_ARG1(regs) ((uintptr_t)(regs).rdi)
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).rsi)
 #define ARCH_ARG3(regs) ((uintptr_t)(regs).rdx)
@@ -94,6 +95,7 @@ typedef struct user_regs_struct arch_regs_t;
 typedef struct user_pt_regs arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).sp)
 #define ARCH_SYSCALL_NR(regs) ((long)(regs).regs[8])
+#define ARCH_RET(regs) ((long)(regs).regs[0])
 #define ARCH_ARG1(regs) ((uintptr_t)(regs).regs[0])
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).regs[1])
 #define ARCH_ARG3(regs) ((uintptr_t)(regs).regs[2])
@@ -106,6 +108,7 @@ typedef struct user_pt_regs arch_regs_t;
 typedef struct user_regs arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).uregs[13])
 #define ARCH_SYSCALL_NR(regs) ((long)(regs).uregs[7])
+#define ARCH_RET(regs) ((long)(regs).uregs[0])
 #define ARCH_ARG1(regs) ((uintptr_t)(regs).uregs[0])
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).uregs[1])
 #define ARCH_ARG3(regs) ((uintptr_t)(regs).uregs[2])
@@ -118,6 +121,7 @@ typedef struct user_regs arch_regs_t;
 typedef struct user_regs_struct arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).esp)
 #define ARCH_SYSCALL_NR(regs) ((long)(regs).orig_eax)
+#define ARCH_RET(regs) ((long)(regs).eax)
 #define ARCH_ARG1(regs) ((uintptr_t)(regs).ebx)
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).ecx)
 #define ARCH_ARG3(regs) ((uintptr_t)(regs).edx)
@@ -278,7 +282,10 @@ int main(int argc, char *argv[]) {
 
             execve("/bin/sh", exec_args, environ);
 
-            fprintf(stderr, "CHILD_EXECVE_FAILED errno=%d (%s)\n", errno, strerror(errno));
+            int err = errno;
+            printf("CHILD_EXECVE_FAILED errno=%d (%s)\n", err, strerror(err));
+            fflush(stdout);
+            fflush(stderr);
             exit(1);
         }
     } else {
@@ -300,6 +307,7 @@ int main(int argc, char *argv[]) {
         }
 
         int in_syscall = 0;
+        long last_syscall = -1;
         int next_sig = 0;
 
         while (1) {
@@ -332,6 +340,7 @@ int main(int argc, char *argv[]) {
                         arch_regs_t regs;
                         if (get_child_regs(child, &regs) == 0) {
                             long syscall_nr = ARCH_SYSCALL_NR(regs);
+                            last_syscall = syscall_nr;
                             uintptr_t sp = ARCH_SP(regs);
 
                             if (!is_gate2) {
@@ -460,6 +469,16 @@ int main(int argc, char *argv[]) {
                         }
                     } else {
                         in_syscall = 0;
+                        if (is_gate2 && last_syscall == __NR_execve) {
+                            arch_regs_t regs;
+                            if (get_child_regs(child, &regs) == 0) {
+                                long ret = ARCH_RET(regs);
+                                if (ret < 0) {
+                                    printf("SUPERVISOR: execve returned error=%ld (%s)\n", -ret, strerror((int)-ret));
+                                    fflush(stdout);
+                                }
+                            }
+                        }
                     }
                 } else if (sig != SIGTRAP && sig != SIGSTOP) {
                     next_sig = sig;
