@@ -49,62 +49,57 @@ class SyscallProbeRunner(private val context: Context) {
 
         emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
 
-        var rewriteSuccess = false
+        var redirectedLogFound = false
         var childReadSuccess = false
 
         val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
             emit(ProbeEvent.Log("  $logLine"))
-            if (logLine.contains("GATE_1_5_RESULT: VFS_REWRITE_SUCCESS")) {
-                rewriteSuccess = true
-            }
-            if (logLine.contains("CHILD_READ: VFS_INTERCEPTION_VALIDATED")) {
-                childReadSuccess = true
-            }
+            if (logLine.contains("Redirected openat")) redirectedLogFound = true
+            if (logLine.contains("CHILD_READ: VFS_INTERCEPTION_VALIDATED")) childReadSuccess = true
         }
 
-        val success = processResult.exitCode == 0 && rewriteSuccess && childReadSuccess
+        val success = processResult.exitCode == 0 && redirectedLogFound && childReadSuccess
 
         if (success) {
-            emit(ProbeEvent.Log("  -> Subprocess exited successfully / VFS path rewriting validated (SUCCESS)"))
+            emit(ProbeEvent.Log("  -> ptrace syscall interception & path rewriting succeeded (SUCCESS)"))
         } else {
             val reason = processResult.failureBadge
             emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
         }
 
-        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 1.5 Feasibility Gate Results..."))
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 1.5 Feasibility Results..."))
         if (success) {
-            emit(ProbeEvent.Log("SUCCESS: Syscall interception & path rewriting validated."))
+            emit(ProbeEvent.Log("SUCCESS: Native Ptrace Syscall Interception & VFS Path Rewriting validated."))
             emit(ProbeEvent.Completed(true, "PASSED (GATE 1.5)", true))
         } else {
-            val badge = if (processResult.exitCode != 0) processResult.failureBadge else "FAILED: VFS_REWRITE_FAILED"
+            val badge = if (processResult.exitCode != 0) {
+                when (processResult.exitCode) {
+                    126 -> "FAILED: EPERM"
+                    127 -> "FAILED: ENOENT"
+                    139 -> "FAILED: SIGSEGV"
+                    159 -> "FAILED: SIGSYS"
+                    else -> "FAILED: EXIT_${processResult.exitCode}"
+                }
+            } else {
+                "FAILED: VFS_INTERCEPTION_FAILED"
+            }
             emit(ProbeEvent.Log("FAILURE: $badge"))
             emit(ProbeEvent.Completed(false, badge, false))
         }
     }.flowOn(Dispatchers.IO)
 
-    fun runGate2Probe(): Flow<ProbeEvent> = runGate3_2Probe()
-    fun runGate3_1Probe(): Flow<ProbeEvent> = runGate3_2Probe()
-
-    fun runGate3_2Probe(): Flow<ProbeEvent> = flow {
-        emit(ProbeEvent.Log("=== Gate 3.2: CWD Tracking & Mini-Rootfs Execution ==="))
+    fun runGate2Probe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 2: PRoot Subprocess Supervision & Rootfs Execution ==="))
 
         val rootfsDir = File(context.filesDir, "rootfs")
         val binDir = File(rootfsDir, "bin")
-        val etcDir = File(rootfsDir, "etc")
-
         binDir.mkdirs()
-        etcDir.mkdirs()
 
-        val stagedShFile = File(binDir, "sh")
-        stagedShFile.writeText("#!/bin/sh\n")
-        stagedShFile.setExecutable(true, false)
-
-        val stagedCatFile = File(binDir, "cat")
-        stagedCatFile.writeText("#!/bin/sh\n")
-        stagedCatFile.setExecutable(true, false)
-
-        val hostnameFile = File(etcDir, "hostname")
-        hostnameFile.writeText("vportable-node1\n")
+        val binSh = File(binDir, "sh")
+        if (!binSh.exists()) {
+            binSh.writeText("#!/system/bin/sh\necho VFS_ROOTFS_EXEC_SUCCESS\n")
+            binSh.setExecutable(true)
+        }
 
         val nativeDir = context.applicationInfo.nativeLibraryDir
         val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
@@ -112,8 +107,7 @@ class SyscallProbeRunner(private val context: Context) {
 
         emit(ProbeEvent.Log("[1/4] Staging virtual rootfs structure in ${rootfsDir.absolutePath}..."))
         emit(ProbeEvent.Log("       Rootfs bin: ${binDir.absolutePath}"))
-        emit(ProbeEvent.Log("       Rootfs etc: ${etcDir.absolutePath}"))
-        emit(ProbeEvent.Log("       Staged hostname: ${hostnameFile.absolutePath} (content: vportable-node1)"))
+        emit(ProbeEvent.Log("       Staged script: ${binSh.absolutePath}"))
 
         val ptraceBinary = File(nativePtraceProbePath)
         val busyboxBinary = File(nativeBusyboxPath)
@@ -125,7 +119,180 @@ class SyscallProbeRunner(private val context: Context) {
         }
 
         if (!busyboxBinary.exists()) {
-            emit(ProbeEvent.Log("ERROR: Native busybox library missing in $nativeDir ($nativeBusyboxPath)"))
+            emit(ProbeEvent.Log("WARNING: Busybox binary missing in $nativeDir ($nativeBusyboxPath)"))
+        }
+
+        emit(ProbeEvent.Log("[2/4] Native binaries verified at $nativeDir"))
+        emit(ProbeEvent.Log("       Supervisor: ${ptraceBinary.name} (canExecute: ${ptraceBinary.canExecute()})"))
+
+        val env = mapOf("PROOT_NO_SECCOMP" to "1")
+        val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir)
+
+        val testCase = TestCase(
+            name = "Gate 2 PRoot Supervisor & Rootfs Execution Probe",
+            command = command,
+            env = env
+        )
+
+        emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
+
+        var execveRedirectFound = false
+        var rootfsExecSuccess = false
+
+        val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
+            emit(ProbeEvent.Log("  $logLine"))
+            if (logLine.contains("Redirected execve /bin/sh")) execveRedirectFound = true
+            if (logLine.contains("VFS_ROOTFS_EXEC_SUCCESS")) rootfsExecSuccess = true
+        }
+
+        val success = processResult.exitCode == 0 && (execveRedirectFound || rootfsExecSuccess)
+
+        if (success) {
+            emit(ProbeEvent.Log("  -> Rootfs execution & execve redirection verified (SUCCESS)"))
+        } else {
+            val reason = processResult.failureBadge
+            emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
+        }
+
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 2 Feasibility Results..."))
+        if (success) {
+            emit(ProbeEvent.Log("SUCCESS: PRoot supervisor & VFS rootfs execution validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (GATE 2)", true))
+        } else {
+            val badge = if (processResult.exitCode != 0) {
+                when (processResult.exitCode) {
+                    126 -> "FAILED: EPERM"
+                    127 -> "FAILED: ENOENT"
+                    139 -> "FAILED: SIGSEGV"
+                    159 -> "FAILED: SIGSYS"
+                    else -> "FAILED: EXIT_${processResult.exitCode}"
+                }
+            } else {
+                "FAILED: VFS_EXEC_FAILED"
+            }
+            emit(ProbeEvent.Log("FAILURE: $badge"))
+            emit(ProbeEvent.Completed(false, badge, false))
+        }
+    }.flowOn(Dispatchers.IO)
+
+    fun runGate3_1Probe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 3.1: Multi-Process Supervision & Tree Tracking ==="))
+
+        val rootfsDir = File(context.filesDir, "rootfs")
+        val binDir = File(rootfsDir, "bin")
+        binDir.mkdirs()
+
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
+        val nativeBusyboxPath = "$nativeDir/libbusybox.so"
+
+        emit(ProbeEvent.Log("[1/4] Staging virtual rootfs structure in ${rootfsDir.absolutePath}..."))
+
+        val ptraceBinary = File(nativePtraceProbePath)
+        val busyboxBinary = File(nativeBusyboxPath)
+
+        if (!ptraceBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: Native supervisor missing in $nativeDir ($nativePtraceProbePath)"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        if (!busyboxBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: BusyBox missing in $nativeDir ($nativeBusyboxPath)"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        emit(ProbeEvent.Log("[2/4] Native binaries verified at $nativeDir"))
+        emit(ProbeEvent.Log("       Supervisor: ${ptraceBinary.name} (canExecute: ${ptraceBinary.canExecute()})"))
+        emit(ProbeEvent.Log("       BusyBox: ${busyboxBinary.name} (canExecute: ${busyboxBinary.canExecute()})"))
+
+        val targetCmd = "sh -c \"echo GATE_3_1_CHILD_1; sh -c 'echo GATE_3_1_CHILD_2'\""
+        val env = mapOf("PROOT_NO_SECCOMP" to "1")
+        val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir, targetCmd)
+
+        val testCase = TestCase(
+            name = "Gate 3.1 Multi-Process Tree Tracking Probe",
+            command = command,
+            env = env
+        )
+
+        emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
+
+        var child1Found = false
+        var child2Found = false
+        val detectedPids = mutableSetOf<String>()
+
+        val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
+            emit(ProbeEvent.Log("  $logLine"))
+            if (logLine.contains("GATE_3_1_CHILD_1")) child1Found = true
+            if (logLine.contains("GATE_3_1_CHILD_2")) child2Found = true
+
+            val pidMatch = Regex("""Attached to child PID=(\d+)""").find(logLine)
+            pidMatch?.groupValues?.get(1)?.let { pid ->
+                detectedPids.add(pid)
+            }
+        }
+
+        val success = processResult.exitCode == 0 && child1Found && child2Found
+
+        if (success) {
+            emit(ProbeEvent.Log("  -> Multi-process tree tracking verified across ${detectedPids.size + 1} process nodes (SUCCESS)"))
+        } else {
+            val reason = processResult.failureBadge
+            emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
+        }
+
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 3.1 Feasibility Results..."))
+        if (success) {
+            emit(ProbeEvent.Log("SUCCESS: Multi-process tree tracking & attach handling validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (GATE 3.1)", true))
+        } else {
+            val badge = if (processResult.exitCode != 0) {
+                when (processResult.exitCode) {
+                    126 -> "FAILED: EPERM"
+                    127 -> "FAILED: ENOENT"
+                    139 -> "FAILED: SIGSEGV"
+                    159 -> "FAILED: SIGSYS"
+                    else -> "FAILED: EXIT_${processResult.exitCode}"
+                }
+            } else {
+                "FAILED: MULTI_PROC_TRACK_FAILED"
+            }
+            emit(ProbeEvent.Log("FAILURE: $badge"))
+            emit(ProbeEvent.Completed(false, badge, false))
+        }
+    }.flowOn(Dispatchers.IO)
+
+    fun runGate3_2Probe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 3.2: Per-Process State Tracking (CWD & Mini-Rootfs) ==="))
+
+        val rootfsDir = File(context.filesDir, "rootfs")
+        val etcDir = File(rootfsDir, "etc")
+        etcDir.mkdirs()
+
+        val hostnameFile = File(etcDir, "hostname")
+        hostnameFile.writeText("vportable-node1\n")
+
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
+        val nativeBusyboxPath = "$nativeDir/libbusybox.so"
+
+        emit(ProbeEvent.Log("[1/4] Staging virtual rootfs structure in ${rootfsDir.absolutePath}..."))
+        emit(ProbeEvent.Log("       Rootfs etc: ${etcDir.absolutePath}"))
+        emit(ProbeEvent.Log("       Hostname file: ${hostnameFile.absolutePath}"))
+
+        val ptraceBinary = File(nativePtraceProbePath)
+        val busyboxBinary = File(nativeBusyboxPath)
+
+        if (!ptraceBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: Native supervisor missing in $nativeDir ($nativePtraceProbePath)"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        if (!busyboxBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: BusyBox missing in $nativeDir ($nativeBusyboxPath)"))
             emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
             return@flow
         }
@@ -196,7 +363,9 @@ class SyscallProbeRunner(private val context: Context) {
 
         val rootfsDir = File(context.filesDir, "rootfs")
         val libDir = File(rootfsDir, "lib")
+        val lib64Dir = File(rootfsDir, "lib64")
         libDir.mkdirs()
+        lib64Dir.mkdirs()
 
         val nativeDir = context.applicationInfo.nativeLibraryDir
         val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
@@ -206,8 +375,16 @@ class SyscallProbeRunner(private val context: Context) {
         val sourceSharedLib = File(nativeVfsSharedPath)
 
         if (sourceSharedLib.exists()) {
-            sourceSharedLib.copyTo(targetSharedLib, overwrite = true)
-            emit(ProbeEvent.Log("Staged virtual library: ${targetSharedLib.absolutePath}"))
+            val t1 = File(libDir, "libvfs_shared.so")
+            val t2 = File(lib64Dir, "libvfs_shared.so")
+
+            sourceSharedLib.copyTo(t1, overwrite = true)
+            sourceSharedLib.copyTo(t2, overwrite = true)
+
+            t1.setReadable(true, false)
+            t2.setReadable(true, false)
+
+            emit(ProbeEvent.Log("Staged libvfs_shared.so verified: ${t1.absolutePath} (exists: ${t1.exists()}, size: ${t1.length()} bytes)"))
         } else {
             emit(ProbeEvent.Log("WARNING: Source shared library missing at $nativeVfsSharedPath"))
         }
@@ -286,6 +463,132 @@ class SyscallProbeRunner(private val context: Context) {
                 }
             } else {
                 "FAILED: VFS_GATE_4_FAILED"
+            }
+            emit(ProbeEvent.Log("FAILURE: $badge"))
+            emit(ProbeEvent.Completed(false, badge, false))
+        }
+    }.flowOn(Dispatchers.IO)
+
+    fun runGate5Probe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 5: Minimal Container Lifecycle & Dynamic-Driven Engine ==="))
+
+        val rootfsDir = File(context.filesDir, "rootfs")
+        val binDir = File(rootfsDir, "bin")
+        val libDir = File(rootfsDir, "lib")
+        val lib64Dir = File(rootfsDir, "lib64")
+        val etcDir = File(rootfsDir, "etc")
+        binDir.mkdirs()
+        libDir.mkdirs()
+        lib64Dir.mkdirs()
+        etcDir.mkdirs()
+
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
+        val nativeVfsSharedPath = "$nativeDir/libvfs_shared.so"
+        val nativeVfsDynamicBinPath = "$nativeDir/libvfs_dynamic_bin.so"
+
+        val targetSharedLib = File(libDir, "libvfs_shared.so")
+        val sourceSharedLib = File(nativeVfsSharedPath)
+        if (sourceSharedLib.exists()) {
+            val t1 = File(libDir, "libvfs_shared.so")
+            val t2 = File(lib64Dir, "libvfs_shared.so")
+
+            sourceSharedLib.copyTo(t1, overwrite = true)
+            sourceSharedLib.copyTo(t2, overwrite = true)
+
+            t1.setReadable(true, false)
+            t2.setReadable(true, false)
+
+            emit(ProbeEvent.Log("Staged libvfs_shared.so verified: ${t1.absolutePath} (exists: ${t1.exists()}, size: ${t1.length()} bytes)"))
+        }
+
+        val targetDynamicApp = File(binDir, "dynamic_app")
+        val sourceDynamicApp = File(nativeVfsDynamicBinPath)
+        if (sourceDynamicApp.exists()) {
+            sourceDynamicApp.copyTo(targetDynamicApp, overwrite = true)
+            targetDynamicApp.setExecutable(true)
+            emit(ProbeEvent.Log("Staged dynamic executable: ${targetDynamicApp.absolutePath}"))
+        }
+
+        val symlinkApp = File(binDir, "app_link")
+        if (symlinkApp.exists()) {
+            symlinkApp.delete()
+        }
+        try {
+            android.system.Os.symlink("dynamic_app", symlinkApp.absolutePath)
+            emit(ProbeEvent.Log("Created symlink: ${symlinkApp.absolutePath} -> dynamic_app"))
+        } catch (e: Exception) {
+            emit(ProbeEvent.Log("WARNING: Could not create symlink using Os.symlink: ${e.message}"))
+        }
+
+        emit(ProbeEvent.Log("[1/4] Staging virtual rootfs structure in ${rootfsDir.absolutePath}..."))
+
+        val ptraceBinary = File(nativePtraceProbePath)
+        if (!ptraceBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: Native supervisor missing in $nativeDir ($nativePtraceProbePath)"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        if (!targetSharedLib.exists()) {
+            emit(ProbeEvent.Log("ERROR: Staged shared library missing at ${targetSharedLib.absolutePath}"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        if (!targetDynamicApp.exists()) {
+            emit(ProbeEvent.Log("ERROR: Staged dynamic application missing at ${targetDynamicApp.absolutePath}"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        emit(ProbeEvent.Log("[2/4] Native binaries verified at $nativeDir"))
+        emit(ProbeEvent.Log("       Supervisor: ${ptraceBinary.name} (canExecute: ${ptraceBinary.canExecute()})"))
+
+        val env = mapOf("PROOT_NO_SECCOMP" to "1")
+        val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir, "/bin/app_link")
+
+        val testCase = TestCase(
+            name = "Gate 5 Container Lifecycle Probe",
+            command = command,
+            env = env
+        )
+
+        emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
+
+        var lifecycleSuccess = false
+
+        val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
+            emit(ProbeEvent.Log("  $logLine"))
+            if (logLine.contains("GATE_5_RESULT: CONTAINER_LIFECYCLE_SUCCESS")) {
+                lifecycleSuccess = true
+            }
+        }
+
+        val success = processResult.exitCode == 0 && lifecycleSuccess
+
+        if (success) {
+            emit(ProbeEvent.Log("  -> Container lifecycle & automatic dynamic linking verified (SUCCESS)"))
+        } else {
+            val reason = processResult.failureBadge
+            emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
+        }
+
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 5 Feasibility Results..."))
+        if (success) {
+            emit(ProbeEvent.Log("SUCCESS: Minimal container lifecycle & dynamic engine validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (GATE 5)", true))
+        } else {
+            val badge = if (processResult.exitCode != 0) {
+                when (processResult.exitCode) {
+                    126 -> "FAILED: EPERM"
+                    127 -> "FAILED: ENOENT"
+                    139 -> "FAILED: SIGSEGV"
+                    159 -> "FAILED: SIGSYS"
+                    else -> "FAILED: EXIT_${processResult.exitCode}"
+                }
+            } else {
+                "FAILED: CONTAINER_LIFECYCLE_FAILED"
             }
             emit(ProbeEvent.Log("FAILURE: $badge"))
             emit(ProbeEvent.Completed(false, badge, false))
