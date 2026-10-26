@@ -147,7 +147,6 @@ typedef struct user_regs_struct arch_regs_t;
 #define SET_ARCH_ARG2(regs, val) ((regs).ecx = (unsigned long)(val))
 #endif
 
-// ---------------- Process Tracking & Process Group Cleanup ----------------
 #define MAX_TRACKED_PIDS 64
 typedef struct {
     pid_t pid;
@@ -160,17 +159,14 @@ typedef struct {
 
 static pid_state_t pid_table[MAX_TRACKED_PIDS];
 static pid_t g_child_pgid = 0;
+static char g_rootfs_dir[1024] = {0};
 static char g_native_lib_dir[1024] = {0};
 
 static pid_state_t* get_or_create_pid(pid_t pid) {
     int free_idx = -1;
     for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
-        if (pid_table[i].is_active && pid_table[i].pid == pid) {
-            return &pid_table[i];
-        }
-        if (!pid_table[i].is_active && free_idx == -1) {
-            free_idx = i;
-        }
+        if (pid_table[i].is_active && pid_table[i].pid == pid) return &pid_table[i];
+        if (!pid_table[i].is_active && free_idx == -1) free_idx = i;
     }
     if (free_idx != -1) {
         pid_table[free_idx].pid = pid;
@@ -214,7 +210,6 @@ static void signal_handler(int sig) {
     _exit(128 + sig);
 }
 
-// ---------------- Smart Mount Table with Overlay Fallback ----------------
 typedef struct {
     const char *guest_prefix;
     char host_target[1024];
@@ -242,18 +237,50 @@ static void init_mount_table(const char *rootfs_dir) {
 static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
     if (in_path == NULL || out_path == NULL) return 0;
 
-    // 1. Direct redirection for our shared library to native library dir where it definitely exists
+    // 1. Smart resolution for libvfs_shared.so: locate where it ACTUALLY exists!
     if (strstr(in_path, "libvfs_shared.so") != NULL) {
-        snprintf(out_path, out_size, "%s/libvfs_shared.so", g_native_lib_dir);
-        return 1;
+        char try_path[2048];
+        struct stat st;
+
+        // Candidate A: Rootfs /lib/
+        snprintf(try_path, sizeof(try_path), "%s/lib/libvfs_shared.so", g_rootfs_dir);
+        if (stat(try_path, &st) == 0 && st.st_size > 0) {
+            strncpy(out_path, try_path, out_size - 1);
+            out_path[out_size - 1] = '\0';
+            return 1;
+        }
+
+        // Candidate B: Rootfs /system/lib64/
+        snprintf(try_path, sizeof(try_path), "%s/system/lib64/libvfs_shared.so", g_rootfs_dir);
+        if (stat(try_path, &st) == 0 && st.st_size > 0) {
+            strncpy(out_path, try_path, out_size - 1);
+            out_path[out_size - 1] = '\0';
+            return 1;
+        }
+
+        // Candidate C: Native library directory
+        snprintf(try_path, sizeof(try_path), "%s/libvfs_shared.so", g_native_lib_dir);
+        if (stat(try_path, &st) == 0 && st.st_size > 0) {
+            strncpy(out_path, try_path, out_size - 1);
+            out_path[out_size - 1] = '\0';
+            return 1;
+        }
+
+        // Candidate D: Native library directory in parent
+        snprintf(try_path, sizeof(try_path), "%s/libvfs_shared.so", g_rootfs_dir);
+        if (stat(try_path, &st) == 0 && st.st_size > 0) {
+            strncpy(out_path, try_path, out_size - 1);
+            out_path[out_size - 1] = '\0';
+            return 1;
+        }
     }
 
-    // 2. Allow Bionic linker config to pass through to host system
+    // 2. Pass-through linker configuration to host system
     if (strstr(in_path, "ld.config") != NULL) {
         return 0;
     }
 
-    // 3. Fallback check: only redirect if the target actually exists in rootfs!
+    // 3. Fallback check: only redirect if target actually exists on host storage!
     for (int i = 0; i < 5; i++) {
         size_t plen = strlen(mount_table[i].guest_prefix);
         if (strncmp(in_path, mount_table[i].guest_prefix, plen) == 0) {
@@ -273,7 +300,6 @@ static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size
     return 0;
 }
 
-// Helper: resolve relative path against process CWD
 static void resolve_relative_or_absolute(const char *in_path, const char *cwd, char *out_path, size_t out_size) {
     if (in_path[0] == '/') {
         strncpy(out_path, in_path, out_size - 1);
@@ -287,7 +313,6 @@ static void resolve_relative_or_absolute(const char *in_path, const char *cwd, c
     }
 }
 
-// ---------------- Memory & Reg Helpers ----------------
 static int get_child_regs(pid_t child, arch_regs_t *regs) {
     struct iovec iov = { .iov_base = regs, .iov_len = sizeof(*regs) };
     return ptrace(PTRACE_GETREGSET, child, (void*)(uintptr_t)NT_PRSTATUS, &iov);
@@ -325,7 +350,6 @@ static void ensure_argv0(pid_t child, uintptr_t argv_ptr, uintptr_t sh_addr, con
     }
 }
 
-// ---------------- Main Supervisor Logic ----------------
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr, "USAGE: %s <rootfs_dir> <native_lib_dir> <command> [args...]\n", argv[0]);
@@ -337,6 +361,7 @@ int main(int argc, char *argv[]) {
     const char *command = argv[3];
     char **cmd_argv = &argv[3];
 
+    strncpy(g_rootfs_dir, rootfs_dir, sizeof(g_rootfs_dir) - 1);
     strncpy(g_native_lib_dir, native_lib_dir, sizeof(g_native_lib_dir) - 1);
     init_mount_table(rootfs_dir);
 
@@ -344,7 +369,6 @@ int main(int argc, char *argv[]) {
     if (child < 0) return 1;
 
     if (child == 0) {
-        // Child Process
         setpgid(0, 0);
 
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
@@ -361,7 +385,6 @@ int main(int argc, char *argv[]) {
         _exit(127);
     }
 
-    // Supervisor Process
     g_child_pgid = child;
     memset(pid_table, 0, sizeof(pid_table));
     get_or_create_pid(child);
@@ -401,7 +424,6 @@ int main(int argc, char *argv[]) {
             int sig = WSTOPSIG(status);
             int event = (status >> 16) & 0xff;
 
-            // Handle Fork / Clone / Exec
             if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
                 unsigned long new_child = 0;
                 ptrace(PTRACE_GETEVENTMSG, cur_pid, NULL, &new_child);
@@ -423,7 +445,6 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // Handle Syscalls
             if (sig == (SIGTRAP | 0x80)) {
                 if (!ps->in_syscall) {
                     ps->in_syscall = 1;
@@ -470,8 +491,8 @@ int main(int argc, char *argv[]) {
                                         if (scr != 0) {
                                             SET_ARCH_ARG2(regs, scr);
                                             set_child_regs(cur_pid, &regs);
-                                            printf("SUPERVISOR [PID=%d]: Redirected openat %s -> %s\n",
-                                                   cur_pid, full_virtual, rew_path);
+                                            printf("SUPERVISOR [PID=%d]: Redirected %s %s -> %s\n",
+                                                   cur_pid, (nr == __NR_openat ? "openat" : "newfstatat"), full_virtual, rew_path);
                                             fflush(stdout);
                                         }
                                     }
@@ -519,7 +540,18 @@ int main(int argc, char *argv[]) {
                     }
                 } else {
                     ps->in_syscall = 0;
-                    if (ps->last_syscall == __NR_chdir && ps->pending_chdir[0] != '\0') {
+                    if (ps->last_syscall == __NR_openat) {
+                        arch_regs_t regs;
+                        if (get_child_regs(cur_pid, &regs) == 0) {
+                            long ret = ARCH_RET(regs);
+                            if (ret >= 0) {
+                                printf("SUPERVISOR [PID=%d]: openat SUCCESS fd=%ld\n", cur_pid, ret);
+                            } else {
+                                printf("SUPERVISOR [PID=%d]: openat FAILED errno=%ld (%s)\n", cur_pid, -ret, strerror((int)-ret));
+                            }
+                            fflush(stdout);
+                        }
+                    } else if (ps->last_syscall == __NR_chdir && ps->pending_chdir[0] != '\0') {
                         arch_regs_t regs;
                         if (get_child_regs(cur_pid, &regs) == 0) {
                             if (ARCH_RET(regs) == 0) {
