@@ -399,10 +399,11 @@ int main(int argc, char *argv[]) {
 
             // Handle Syscalls
             if (sig == (SIGTRAP | 0x80)) {
-                if (!ps->in_syscall) {
-                    ps->in_syscall = 1;
-                    arch_regs_t regs;
-                    if (get_child_regs(cur_pid, &regs) == 0) {
+                arch_regs_t regs;
+                if (get_child_regs(cur_pid, &regs) == 0) {
+                    int is_entry = (ARCH_RET(regs) == -ENOSYS);
+
+                    if (is_entry) {
                         long nr = ARCH_SYSCALL_NR(regs);
                         ps->last_syscall = nr;
                         uintptr_t sp = ARCH_SP(regs);
@@ -444,8 +445,8 @@ int main(int argc, char *argv[]) {
                                         if (scr != 0) {
                                             SET_ARCH_ARG2(regs, scr);
                                             set_child_regs(cur_pid, &regs);
-                                            printf("SUPERVISOR [PID=%d]: Redirected openat %s -> %s\n",
-                                                   cur_pid, full_virtual, rew_path);
+                                            printf("SUPERVISOR [PID=%d]: Redirected %s %s -> %s\n",
+                                                   cur_pid, (nr == __NR_openat ? "openat" : "newfstatat"), full_virtual, rew_path);
                                             fflush(stdout);
                                         }
                                     }
@@ -490,19 +491,16 @@ int main(int argc, char *argv[]) {
                                 }
                             }
                         }
-                    }
-                } else {
-                    ps->in_syscall = 0;
-                    if (ps->last_syscall == __NR_chdir && ps->pending_chdir[0] != '\0') {
-                        arch_regs_t regs;
-                        if (get_child_regs(cur_pid, &regs) == 0) {
+                    } else {
+                        // Syscall EXIT
+                        if (ps->last_syscall == __NR_chdir && ps->pending_chdir[0] != '\0') {
                             if (ARCH_RET(regs) == 0) {
                                 strncpy(ps->cwd, ps->pending_chdir, sizeof(ps->cwd));
                                 printf("SUPERVISOR [PID=%d]: chdir successful, updated CWD=%s\n", cur_pid, ps->cwd);
                                 fflush(stdout);
                             }
+                            ps->pending_chdir[0] = '\0';
                         }
-                        ps->pending_chdir[0] = '\0';
                     }
                 }
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
