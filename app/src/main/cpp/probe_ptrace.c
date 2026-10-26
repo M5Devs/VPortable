@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <elf.h>
 #include <signal.h>
+#include <linux/types.h>
 
 #ifndef NT_PRSTATUS
 #define NT_PRSTATUS 1
@@ -45,6 +46,35 @@
 #ifndef PTRACE_GETEVENTMSG
 #define PTRACE_GETEVENTMSG 0x4201
 #endif
+#ifndef PTRACE_GET_SYSCALL_INFO
+#define PTRACE_GET_SYSCALL_INFO 0x420e
+#endif
+#define PTRACE_SYSCALL_INFO_ENTRY 1
+#define PTRACE_SYSCALL_INFO_EXIT 2
+
+struct ptrace_syscall_info {
+    __u8 op;
+    __u8 pad[3];
+    __u32 arch;
+    __u64 instruction_pointer;
+    __u64 stack_pointer;
+    union {
+        struct {
+            __u64 nr;
+            __u64 args[6];
+        } entry;
+        struct {
+            __s64 rval;
+            __u8 is_error;
+        } exit;
+        struct {
+            __u64 nr;
+            __u64 args[6];
+            __u32 ret_data;
+        } seccomp;
+    };
+};
+
 #ifndef PTRACE_EVENT_FORK
 #define PTRACE_EVENT_FORK 1
 #endif
@@ -150,7 +180,6 @@ typedef struct user_regs_struct arch_regs_t;
 #define MAX_TRACKED_PIDS 64
 typedef struct {
     pid_t pid;
-    int in_syscall;
     long last_syscall;
     int is_active;
     char cwd[1024];
@@ -170,7 +199,6 @@ static pid_state_t* get_or_create_pid(pid_t pid) {
     }
     if (free_idx != -1) {
         pid_table[free_idx].pid = pid;
-        pid_table[free_idx].in_syscall = 0;
         pid_table[free_idx].last_syscall = -1;
         pid_table[free_idx].is_active = 1;
         strcpy(pid_table[free_idx].cwd, "/");
@@ -237,12 +265,11 @@ static void init_mount_table(const char *rootfs_dir) {
 static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
     if (in_path == NULL || out_path == NULL) return 0;
 
-    // 1. Smart resolution for libvfs_shared.so: locate where it ACTUALLY exists!
+    // Direct redirection for libvfs_shared.so to where it definitely exists
     if (strstr(in_path, "libvfs_shared.so") != NULL) {
         char try_path[2048];
         struct stat st;
 
-        // Candidate A: Rootfs /lib/
         snprintf(try_path, sizeof(try_path), "%s/lib/libvfs_shared.so", g_rootfs_dir);
         if (stat(try_path, &st) == 0 && st.st_size > 0) {
             strncpy(out_path, try_path, out_size - 1);
@@ -250,37 +277,18 @@ static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size
             return 1;
         }
 
-        // Candidate B: Rootfs /system/lib64/
-        snprintf(try_path, sizeof(try_path), "%s/system/lib64/libvfs_shared.so", g_rootfs_dir);
-        if (stat(try_path, &st) == 0 && st.st_size > 0) {
-            strncpy(out_path, try_path, out_size - 1);
-            out_path[out_size - 1] = '\0';
-            return 1;
-        }
-
-        // Candidate C: Native library directory
         snprintf(try_path, sizeof(try_path), "%s/libvfs_shared.so", g_native_lib_dir);
         if (stat(try_path, &st) == 0 && st.st_size > 0) {
             strncpy(out_path, try_path, out_size - 1);
             out_path[out_size - 1] = '\0';
             return 1;
         }
-
-        // Candidate D: Native library directory in parent
-        snprintf(try_path, sizeof(try_path), "%s/libvfs_shared.so", g_rootfs_dir);
-        if (stat(try_path, &st) == 0 && st.st_size > 0) {
-            strncpy(out_path, try_path, out_size - 1);
-            out_path[out_size - 1] = '\0';
-            return 1;
-        }
     }
 
-    // 2. Pass-through linker configuration to host system
     if (strstr(in_path, "ld.config") != NULL) {
         return 0;
     }
 
-    // 3. Fallback check: only redirect if target actually exists on host storage!
     for (int i = 0; i < 5; i++) {
         size_t plen = strlen(mount_table[i].guest_prefix);
         if (strncmp(in_path, mount_table[i].guest_prefix, plen) == 0) {
@@ -332,22 +340,6 @@ static uintptr_t write_to_child_scratch(pid_t child, uintptr_t sp, const char *s
         return scratch_addr;
     }
     return 0;
-}
-
-static void ensure_argv0(pid_t child, uintptr_t argv_ptr, uintptr_t sh_addr, const char *applet_name) {
-    if (argv_ptr == 0) return;
-    uintptr_t orig_argv0 = 0;
-    struct iovec r_l = { .iov_base = &orig_argv0, .iov_len = sizeof(orig_argv0) };
-    struct iovec r_r = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(orig_argv0) };
-    if (process_vm_readv(child, &r_l, 1, &r_r, 1, 0) <= 0 || orig_argv0 == 0) return;
-
-    size_t alen = strlen(applet_name) + 1;
-    uintptr_t scr = write_to_child_scratch(child, sh_addr, applet_name, alen);
-    if (scr != 0) {
-        struct iovec w_l = { .iov_base = &scr, .iov_len = sizeof(scr) };
-        struct iovec w_r = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(scr) };
-        process_vm_writev(child, &w_l, 1, &w_r, 1, 0);
-    }
 }
 
 int main(int argc, char *argv[]) {
@@ -429,27 +421,33 @@ int main(int argc, char *argv[]) {
                 ptrace(PTRACE_GETEVENTMSG, cur_pid, NULL, &new_child);
                 if (new_child > 0) {
                     pid_state_t *new_ps = get_or_create_pid((pid_t)new_child);
-                    if (new_ps) {
-                        strncpy(new_ps->cwd, ps->cwd, sizeof(new_ps->cwd));
-                    }
-                    printf("SUPERVISOR: Attached to child PID=%lu (inherited CWD=%s)\n", new_child, ps->cwd);
-                    fflush(stdout);
+                    if (new_ps) strncpy(new_ps->cwd, ps->cwd, sizeof(new_ps->cwd));
                 }
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
                 continue;
             }
 
             if (event == PTRACE_EVENT_EXEC) {
-                ps->in_syscall = 0;
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
                 continue;
             }
 
             if (sig == (SIGTRAP | 0x80)) {
-                if (!ps->in_syscall) {
-                    ps->in_syscall = 1;
-                    arch_regs_t regs;
-                    if (get_child_regs(cur_pid, &regs) == 0) {
+                struct ptrace_syscall_info sys_info;
+                int has_info = (ptrace(PTRACE_GET_SYSCALL_INFO, cur_pid, (void*)sizeof(sys_info), &sys_info) == 0);
+
+                arch_regs_t regs;
+                if (get_child_regs(cur_pid, &regs) == 0) {
+                    // Determine Entry vs Exit reliably using Kernel Syscall Info or Register state
+                    int is_entry = 0;
+                    if (has_info) {
+                        is_entry = (sys_info.op == PTRACE_SYSCALL_INFO_ENTRY);
+                    } else {
+                        is_entry = (ARCH_RET(regs) == -ENOSYS);
+                    }
+
+                    if (is_entry) {
+                        // ---------------- SYSCALL ENTRY ----------------
                         long nr = ARCH_SYSCALL_NR(regs);
                         ps->last_syscall = nr;
                         uintptr_t sp = ARCH_SP(regs);
@@ -520,29 +518,13 @@ int main(int argc, char *argv[]) {
                                                    cur_pid, full_virtual, rew_path);
                                             fflush(stdout);
                                         }
-                                    } else if (strncmp(full_virtual, "/bin/", 5) == 0) {
-                                        const char *applet = full_virtual + 5;
-                                        char busybox_path[2048] = {0};
-                                        snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", native_lib_dir);
-                                        uintptr_t scr = write_to_child_scratch(cur_pid, sp, busybox_path, strlen(busybox_path)+1);
-                                        if (scr != 0) {
-                                            SET_ARCH_ARG1(regs, scr);
-                                            ensure_argv0(cur_pid, ARCH_ARG2(regs), scr, applet);
-                                            set_child_regs(cur_pid, &regs);
-                                            printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s (applet=%s)\n",
-                                                   cur_pid, full_virtual, busybox_path, applet);
-                                            fflush(stdout);
-                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                } else {
-                    ps->in_syscall = 0;
-                    if (ps->last_syscall == __NR_openat) {
-                        arch_regs_t regs;
-                        if (get_child_regs(cur_pid, &regs) == 0) {
+                    } else {
+                        // ---------------- SYSCALL EXIT ----------------
+                        if (ps->last_syscall == __NR_openat) {
                             long ret = ARCH_RET(regs);
                             if (ret >= 0) {
                                 printf("SUPERVISOR [PID=%d]: openat SUCCESS fd=%ld\n", cur_pid, ret);
@@ -550,22 +532,18 @@ int main(int argc, char *argv[]) {
                                 printf("SUPERVISOR [PID=%d]: openat FAILED errno=%ld (%s)\n", cur_pid, -ret, strerror((int)-ret));
                             }
                             fflush(stdout);
-                        }
-                    } else if (ps->last_syscall == __NR_chdir && ps->pending_chdir[0] != '\0') {
-                        arch_regs_t regs;
-                        if (get_child_regs(cur_pid, &regs) == 0) {
+                        } else if (ps->last_syscall == __NR_chdir && ps->pending_chdir[0] != '\0') {
                             if (ARCH_RET(regs) == 0) {
                                 strncpy(ps->cwd, ps->pending_chdir, sizeof(ps->cwd));
                                 printf("SUPERVISOR [PID=%d]: chdir successful, updated CWD=%s\n", cur_pid, ps->cwd);
                                 fflush(stdout);
                             }
+                            ps->pending_chdir[0] = '\0';
                         }
-                        ps->pending_chdir[0] = '\0';
                     }
                 }
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else if (sig == SIGTRAP) {
-                ps->in_syscall = 0;
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else if (sig == SIGSTOP) {
                 ptrace(PTRACE_SETOPTIONS, cur_pid, NULL, (void*)options);
