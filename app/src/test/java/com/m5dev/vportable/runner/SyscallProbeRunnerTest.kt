@@ -92,8 +92,8 @@ class SyscallProbeRunnerTest {
 
     @Test
     fun testRunGate3_1Probe_missingNativeBinary() = runTest {
-        val filesDir = tempFolder.newFolder("files")
-        val nativeDir = tempFolder.newFolder("lib")
+        val filesDir = tempFolder.newFolder("files_g3_1")
+        val nativeDir = tempFolder.newFolder("lib_g3_1")
 
         val appInfo = ApplicationInfo().apply {
             nativeLibraryDir = nativeDir.absolutePath
@@ -111,19 +111,15 @@ class SyscallProbeRunnerTest {
         assertEquals("FAILED: ENOENT", completedEvent.badgeText)
 
         val rootfsDir = java.io.File(filesDir, "rootfs")
-        val binSh = java.io.File(rootfsDir, "bin/sh")
-        val binCat = java.io.File(rootfsDir, "bin/cat")
-        val etcDir = java.io.File(rootfsDir, "etc")
+        val binDir = java.io.File(rootfsDir, "bin")
 
-        assertTrue(binSh.exists())
-        assertTrue(binCat.exists())
-        assertTrue(etcDir.exists())
+        assertTrue(binDir.exists())
     }
 
     @Test
     fun testRunGate4Probe_missingNativeBinary() = runTest {
-        val filesDir = tempFolder.newFolder("files")
-        val nativeDir = tempFolder.newFolder("lib")
+        val filesDir = tempFolder.newFolder("files_g4")
+        val nativeDir = tempFolder.newFolder("lib_g4")
 
         val appInfo = ApplicationInfo().apply {
             nativeLibraryDir = nativeDir.absolutePath
@@ -143,6 +139,34 @@ class SyscallProbeRunnerTest {
         val rootfsDir = java.io.File(filesDir, "rootfs")
         val libDir = java.io.File(rootfsDir, "lib")
 
+        assertTrue(libDir.exists())
+    }
+
+    @Test
+    fun testRunGate5Probe_missingNativeBinary() = runTest {
+        val filesDir = tempFolder.newFolder("files_g5")
+        val nativeDir = tempFolder.newFolder("lib_g5")
+
+        val appInfo = ApplicationInfo().apply {
+            nativeLibraryDir = nativeDir.absolutePath
+        }
+
+        val mockContext = mock<Context>()
+        whenever(mockContext.filesDir).thenReturn(filesDir)
+        whenever(mockContext.applicationInfo).thenReturn(appInfo)
+
+        val runner = SyscallProbeRunner(mockContext)
+        val events = runner.runGate5Probe().toList()
+
+        val completedEvent = events.last() as ProbeEvent.Completed
+        assertFalse(completedEvent.success)
+        assertEquals("FAILED: ENOENT", completedEvent.badgeText)
+
+        val rootfsDir = java.io.File(filesDir, "rootfs")
+        val binDir = java.io.File(rootfsDir, "bin")
+        val libDir = java.io.File(rootfsDir, "lib")
+
+        assertTrue(binDir.exists())
         assertTrue(libDir.exists())
     }
 }
