@@ -219,7 +219,7 @@ typedef struct {
     char host_target[1024];
 } mount_entry_t;
 
-static mount_entry_t mount_table[5];
+static mount_entry_t mount_table[4];
 
 static void init_mount_table(const char *rootfs_dir) {
     mount_table[0].guest_prefix = "/bin";
@@ -228,18 +228,15 @@ static void init_mount_table(const char *rootfs_dir) {
     mount_table[1].guest_prefix = "/etc";
     snprintf(mount_table[1].host_target, sizeof(mount_table[1].host_target), "%s/etc", rootfs_dir);
 
-    mount_table[2].guest_prefix = "/system";
-    snprintf(mount_table[2].host_target, sizeof(mount_table[2].host_target), "%s/system", rootfs_dir);
+    mount_table[2].guest_prefix = "/lib64";
+    snprintf(mount_table[2].host_target, sizeof(mount_table[2].host_target), "%s/lib64", rootfs_dir);
 
-    mount_table[3].guest_prefix = "/lib64";
-    snprintf(mount_table[3].host_target, sizeof(mount_table[3].host_target), "%s/lib64", rootfs_dir);
-
-    mount_table[4].guest_prefix = "/lib";
-    snprintf(mount_table[4].host_target, sizeof(mount_table[4].host_target), "%s/lib", rootfs_dir);
+    mount_table[3].guest_prefix = "/lib";
+    snprintf(mount_table[3].host_target, sizeof(mount_table[3].host_target), "%s/lib", rootfs_dir);
 }
 
 static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 4; i++) {
         size_t plen = strlen(mount_table[i].guest_prefix);
         if (strncmp(in_path, mount_table[i].guest_prefix, plen) == 0) {
             if (in_path[plen] == '/' || in_path[plen] == '\0') {

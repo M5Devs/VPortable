@@ -364,12 +364,8 @@ class SyscallProbeRunner(private val context: Context) {
         val rootfsDir = File(context.filesDir, "rootfs")
         val libDir = File(rootfsDir, "lib")
         val lib64Dir = File(rootfsDir, "lib64")
-        val systemLibDir = File(rootfsDir, "system/lib")
-        val systemLib64Dir = File(rootfsDir, "system/lib64")
         libDir.mkdirs()
         lib64Dir.mkdirs()
-        systemLibDir.mkdirs()
-        systemLib64Dir.mkdirs()
 
         val nativeDir = context.applicationInfo.nativeLibraryDir
         val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
@@ -381,20 +377,14 @@ class SyscallProbeRunner(private val context: Context) {
         if (sourceSharedLib.exists()) {
             val t1 = File(libDir, "libvfs_shared.so")
             val t2 = File(lib64Dir, "libvfs_shared.so")
-            val t3 = File(systemLibDir, "libvfs_shared.so")
-            val t4 = File(systemLib64Dir, "libvfs_shared.so")
 
             sourceSharedLib.copyTo(t1, overwrite = true)
             sourceSharedLib.copyTo(t2, overwrite = true)
-            sourceSharedLib.copyTo(t3, overwrite = true)
-            sourceSharedLib.copyTo(t4, overwrite = true)
 
             t1.setReadable(true, false)
             t2.setReadable(true, false)
-            t3.setReadable(true, false)
-            t4.setReadable(true, false)
 
-            emit(ProbeEvent.Log("Staged libvfs_shared.so verified: ${t4.absolutePath} (exists: ${t4.exists()}, size: ${t4.length()} bytes)"))
+            emit(ProbeEvent.Log("Staged libvfs_shared.so verified: ${t1.absolutePath} (exists: ${t1.exists()}, size: ${t1.length()} bytes)"))
         } else {
             emit(ProbeEvent.Log("WARNING: Source shared library missing at $nativeVfsSharedPath"))
         }
@@ -486,14 +476,10 @@ class SyscallProbeRunner(private val context: Context) {
         val binDir = File(rootfsDir, "bin")
         val libDir = File(rootfsDir, "lib")
         val lib64Dir = File(rootfsDir, "lib64")
-        val systemLibDir = File(rootfsDir, "system/lib")
-        val systemLib64Dir = File(rootfsDir, "system/lib64")
         val etcDir = File(rootfsDir, "etc")
         binDir.mkdirs()
         libDir.mkdirs()
         lib64Dir.mkdirs()
-        systemLibDir.mkdirs()
-        systemLib64Dir.mkdirs()
         etcDir.mkdirs()
 
         val nativeDir = context.applicationInfo.nativeLibraryDir
@@ -506,20 +492,14 @@ class SyscallProbeRunner(private val context: Context) {
         if (sourceSharedLib.exists()) {
             val t1 = File(libDir, "libvfs_shared.so")
             val t2 = File(lib64Dir, "libvfs_shared.so")
-            val t3 = File(systemLibDir, "libvfs_shared.so")
-            val t4 = File(systemLib64Dir, "libvfs_shared.so")
 
             sourceSharedLib.copyTo(t1, overwrite = true)
             sourceSharedLib.copyTo(t2, overwrite = true)
-            sourceSharedLib.copyTo(t3, overwrite = true)
-            sourceSharedLib.copyTo(t4, overwrite = true)
 
             t1.setReadable(true, false)
             t2.setReadable(true, false)
-            t3.setReadable(true, false)
-            t4.setReadable(true, false)
 
-            emit(ProbeEvent.Log("Staged libvfs_shared.so verified: ${t4.absolutePath} (exists: ${t4.exists()}, size: ${t4.length()} bytes)"))
+            emit(ProbeEvent.Log("Staged libvfs_shared.so verified: ${t1.absolutePath} (exists: ${t1.exists()}, size: ${t1.length()} bytes)"))
         }
 
         val targetDynamicApp = File(binDir, "dynamic_app")

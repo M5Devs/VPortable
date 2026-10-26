@@ -11,4 +11,5 @@ add_executable(vfs_dynamic_bin vfs_dynamic_bin.c)
 target_link_libraries(vfs_dynamic_bin vfs_shared)
 set_target_properties(vfs_dynamic_bin PROPERTIES
     OUTPUT_NAME "libvfs_dynamic_bin.so"
+    LINK_FLAGS "-Wl,-rpath,/lib -Wl,-rpath,/lib64"
 )
