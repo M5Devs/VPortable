@@ -21,7 +21,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                targets("libprobe_ptrace.so")
+                targets("libprobe_ptrace.so", "vfs_shared")
             }
         }
     }

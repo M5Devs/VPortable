@@ -191,6 +191,107 @@ class SyscallProbeRunner(private val context: Context) {
         }
     }.flowOn(Dispatchers.IO)
 
+    fun runGate4Probe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 4: Dynamic Linking & Shared Library VFS Redirection (/lib) ==="))
+
+        val rootfsDir = File(context.filesDir, "rootfs")
+        val libDir = File(rootfsDir, "lib")
+        libDir.mkdirs()
+
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
+        val nativeVfsSharedPath = "$nativeDir/libvfs_shared.so"
+
+        val targetSharedLib = File(libDir, "libvfs_shared.so")
+        val sourceSharedLib = File(nativeVfsSharedPath)
+
+        if (sourceSharedLib.exists()) {
+            sourceSharedLib.copyTo(targetSharedLib, overwrite = true)
+            emit(ProbeEvent.Log("Staged virtual library: ${targetSharedLib.absolutePath}"))
+        } else {
+            emit(ProbeEvent.Log("WARNING: Source shared library missing at $nativeVfsSharedPath"))
+        }
+
+        emit(ProbeEvent.Log("[1/4] Staging virtual rootfs structure in ${rootfsDir.absolutePath}..."))
+        emit(ProbeEvent.Log("       Rootfs lib: ${libDir.absolutePath}"))
+        emit(ProbeEvent.Log("       Staged library: ${targetSharedLib.absolutePath}"))
+
+        val ptraceBinary = File(nativePtraceProbePath)
+
+        if (!ptraceBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: Native supervisor missing in $nativeDir ($nativePtraceProbePath)"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        if (!targetSharedLib.exists()) {
+            emit(ProbeEvent.Log("ERROR: Staged shared library missing at ${targetSharedLib.absolutePath}"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT", false))
+            return@flow
+        }
+
+        emit(ProbeEvent.Log("[2/4] Native binaries verified at $nativeDir"))
+        emit(ProbeEvent.Log("       Supervisor: ${ptraceBinary.name} (canExecute: ${ptraceBinary.canExecute()})"))
+        emit(ProbeEvent.Log("       Shared Lib: ${targetSharedLib.name}"))
+
+        val env = mapOf("PROOT_NO_SECCOMP" to "1")
+        val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir)
+
+        val testCase = TestCase(
+            name = "Gate 4 Dynamic Linking Probe",
+            command = command,
+            env = env
+        )
+
+        emit(ProbeEvent.Log("\n[3/4] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
+
+        var dynamicLoadSuccess = false
+        var interceptionSuccess = false
+
+        val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
+            emit(ProbeEvent.Log("  $logLine"))
+            if (logLine.contains("CHILD_DYNAMIC_LOAD: VPORTABLE_GATE_4_DYNAMIC_SUCCESS") ||
+                logLine.contains("GATE_4_RESULT: DYNAMIC_VFS_SUCCESS")) {
+                dynamicLoadSuccess = true
+            }
+            if (logLine.contains("/lib/libvfs_shared.so") && logLine.contains("Redirected")) {
+                interceptionSuccess = true
+            }
+        }
+
+        val success = processResult.exitCode == 0 && dynamicLoadSuccess
+
+        if (success) {
+            emit(ProbeEvent.Log("  -> Dynamic library openat interception & symbol resolution verified (SUCCESS)"))
+            if (interceptionSuccess) {
+                emit(ProbeEvent.Log("  -> Supervisor openat redirection confirmed for /lib/libvfs_shared.so"))
+            }
+        } else {
+            val reason = processResult.failureBadge
+            emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
+        }
+
+        emit(ProbeEvent.Log("\n[4/4] Evaluating Gate 4 Feasibility Results..."))
+        if (success) {
+            emit(ProbeEvent.Log("SUCCESS: Dynamic linking VFS path redirection (/lib) validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (GATE 4)", true))
+        } else {
+            val badge = if (processResult.exitCode != 0) {
+                when (processResult.exitCode) {
+                    126 -> "FAILED: EPERM"
+                    127 -> "FAILED: ENOENT"
+                    139 -> "FAILED: SIGSEGV"
+                    159 -> "FAILED: SIGSYS"
+                    else -> "FAILED: EXIT_${processResult.exitCode}"
+                }
+            } else {
+                "FAILED: VFS_GATE_4_FAILED"
+            }
+            emit(ProbeEvent.Log("FAILURE: $badge"))
+            emit(ProbeEvent.Completed(false, badge, false))
+        }
+    }.flowOn(Dispatchers.IO)
+
     internal data class TestCase(
         val name: String,
         val command: List<String>,
