@@ -160,6 +160,7 @@ typedef struct {
 
 static pid_state_t pid_table[MAX_TRACKED_PIDS];
 static pid_t g_child_pgid = 0;
+static char g_native_lib_dir[1024] = {0};
 
 static pid_state_t* get_or_create_pid(pid_t pid) {
     int free_idx = -1;
@@ -213,7 +214,7 @@ static void signal_handler(int sig) {
     _exit(128 + sig);
 }
 
-// ---------------- Generic Mount Table ----------------
+// ---------------- Smart Mount Table with Overlay Fallback ----------------
 typedef struct {
     const char *guest_prefix;
     char host_target[1024];
@@ -239,12 +240,33 @@ static void init_mount_table(const char *rootfs_dir) {
 }
 
 static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
+    if (in_path == NULL || out_path == NULL) return 0;
+
+    // 1. Direct redirection for our shared library to native library dir where it definitely exists
+    if (strstr(in_path, "libvfs_shared.so") != NULL) {
+        snprintf(out_path, out_size, "%s/libvfs_shared.so", g_native_lib_dir);
+        return 1;
+    }
+
+    // 2. Allow Bionic linker config to pass through to host system
+    if (strstr(in_path, "ld.config") != NULL) {
+        return 0;
+    }
+
+    // 3. Fallback check: only redirect if the target actually exists in rootfs!
     for (int i = 0; i < 5; i++) {
         size_t plen = strlen(mount_table[i].guest_prefix);
         if (strncmp(in_path, mount_table[i].guest_prefix, plen) == 0) {
             if (in_path[plen] == '/' || in_path[plen] == '\0') {
-                snprintf(out_path, out_size, "%s%s", mount_table[i].host_target, in_path + plen);
-                return 1;
+                char candidate[2048] = {0};
+                snprintf(candidate, sizeof(candidate), "%s%s", mount_table[i].host_target, in_path + plen);
+
+                struct stat st;
+                if (stat(candidate, &st) == 0 || lstat(candidate, &st) == 0) {
+                    strncpy(out_path, candidate, out_size - 1);
+                    out_path[out_size - 1] = '\0';
+                    return 1;
+                }
             }
         }
     }
@@ -277,7 +299,7 @@ static int set_child_regs(pid_t child, arch_regs_t *regs) {
 }
 
 static uintptr_t write_to_child_scratch(pid_t child, uintptr_t sp, const char *str, size_t len) {
-    uintptr_t scratch_addr = sp - 2048;
+    uintptr_t scratch_addr = (sp - 2048) & ~15UL;
     struct iovec local_iov = { .iov_base = (void*)str, .iov_len = len };
     struct iovec remote_iov = { .iov_base = (void*)scratch_addr, .iov_len = len };
 
@@ -315,6 +337,7 @@ int main(int argc, char *argv[]) {
     const char *command = argv[3];
     char **cmd_argv = &argv[3];
 
+    strncpy(g_native_lib_dir, native_lib_dir, sizeof(g_native_lib_dir) - 1);
     init_mount_table(rootfs_dir);
 
     pid_t child = fork();
