@@ -363,7 +363,11 @@ class SyscallProbeRunner(private val context: Context) {
 
         val rootfsDir = File(context.filesDir, "rootfs")
         val libDir = File(rootfsDir, "lib")
+        val systemLibDir = File(rootfsDir, "system/lib")
+        val systemLib64Dir = File(rootfsDir, "system/lib64")
         libDir.mkdirs()
+        systemLibDir.mkdirs()
+        systemLib64Dir.mkdirs()
 
         val nativeDir = context.applicationInfo.nativeLibraryDir
         val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
@@ -374,6 +378,8 @@ class SyscallProbeRunner(private val context: Context) {
 
         if (sourceSharedLib.exists()) {
             sourceSharedLib.copyTo(targetSharedLib, overwrite = true)
+            sourceSharedLib.copyTo(File(systemLibDir, "libvfs_shared.so"), overwrite = true)
+            sourceSharedLib.copyTo(File(systemLib64Dir, "libvfs_shared.so"), overwrite = true)
             emit(ProbeEvent.Log("Staged virtual library: ${targetSharedLib.absolutePath}"))
         } else {
             emit(ProbeEvent.Log("WARNING: Source shared library missing at $nativeVfsSharedPath"))
@@ -465,9 +471,13 @@ class SyscallProbeRunner(private val context: Context) {
         val rootfsDir = File(context.filesDir, "rootfs")
         val binDir = File(rootfsDir, "bin")
         val libDir = File(rootfsDir, "lib")
+        val systemLibDir = File(rootfsDir, "system/lib")
+        val systemLib64Dir = File(rootfsDir, "system/lib64")
         val etcDir = File(rootfsDir, "etc")
         binDir.mkdirs()
         libDir.mkdirs()
+        systemLibDir.mkdirs()
+        systemLib64Dir.mkdirs()
         etcDir.mkdirs()
 
         val nativeDir = context.applicationInfo.nativeLibraryDir
@@ -479,6 +489,8 @@ class SyscallProbeRunner(private val context: Context) {
         val sourceSharedLib = File(nativeVfsSharedPath)
         if (sourceSharedLib.exists()) {
             sourceSharedLib.copyTo(targetSharedLib, overwrite = true)
+            sourceSharedLib.copyTo(File(systemLibDir, "libvfs_shared.so"), overwrite = true)
+            sourceSharedLib.copyTo(File(systemLib64Dir, "libvfs_shared.so"), overwrite = true)
             emit(ProbeEvent.Log("Staged virtual library: ${targetSharedLib.absolutePath}"))
         }
 
