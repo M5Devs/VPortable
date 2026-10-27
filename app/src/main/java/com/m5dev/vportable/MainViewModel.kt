@@ -38,7 +38,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         viewModelScope.launch {
-            runner.runGate5Probe().collect { event ->
+            runner.runGate6AlpineProbe().collect { event ->
                 when (event) {
                     is ProbeEvent.Log -> {
                         _uiState.value = _uiState.value.copy(

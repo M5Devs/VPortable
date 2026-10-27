@@ -1,6 +1,7 @@
 package com.m5dev.vportable.runner
 
 import android.content.Context
+import com.m5dev.vportable.flasher.VFlashEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -589,6 +590,106 @@ class SyscallProbeRunner(private val context: Context) {
                 }
             } else {
                 "FAILED: CONTAINER_LIFECYCLE_FAILED"
+            }
+            emit(ProbeEvent.Log("FAILURE: $badge"))
+            emit(ProbeEvent.Completed(false, badge, false))
+        }
+    }.flowOn(Dispatchers.IO)
+
+    fun runGate6AlpineProbe(): Flow<ProbeEvent> = flow {
+        emit(ProbeEvent.Log("=== Gate 6: V-Flash Engine & Alpine Linux Mini-Rootfs Boot ==="))
+
+        val rootfsDir = File(context.filesDir, "rootfs")
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
+
+        emit(ProbeEvent.Log("[1/5] Extracting Alpine mini-rootfs tarball via VFlashEngine..."))
+        val extractSuccess = VFlashEngine.extractAlpineRootfs(context, VFlashEngine.DEFAULT_ALPINE_ASSET, rootfsDir)
+
+        if (!extractSuccess) {
+            emit(ProbeEvent.Log("ERROR: VFlashEngine rootfs extraction failed or missing essential binaries."))
+            emit(ProbeEvent.Completed(false, "FAILED: VFLASH_EXTRACT_FAILED", false))
+            return@flow
+        }
+        emit(ProbeEvent.Log("       Rootfs extracted successfully to: ${rootfsDir.absolutePath}"))
+
+        emit(ProbeEvent.Log("[2/5] Verifying extracted Alpine files (/bin/sh and /etc/os-release)..."))
+        val binSh = File(rootfsDir, "bin/sh")
+        val osRelease = File(rootfsDir, "etc/os-release")
+
+        if (!binSh.exists()) {
+            emit(ProbeEvent.Log("ERROR: Target /bin/sh missing in extracted rootfs"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT (/bin/sh)", false))
+            return@flow
+        }
+
+        if (!osRelease.exists()) {
+            emit(ProbeEvent.Log("ERROR: Target /etc/os-release missing in extracted rootfs"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT (/etc/os-release)", false))
+            return@flow
+        }
+
+        emit(ProbeEvent.Log("       /bin/sh verified: ${binSh.absolutePath}"))
+        emit(ProbeEvent.Log("       /etc/os-release verified: ${osRelease.absolutePath}"))
+
+        val ptraceBinary = File(nativePtraceProbePath)
+        if (!ptraceBinary.exists()) {
+            emit(ProbeEvent.Log("ERROR: Native supervisor missing in $nativeDir ($nativePtraceProbePath)"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT (supervisor)", false))
+            return@flow
+        }
+
+        emit(ProbeEvent.Log("[3/5] Native supervisor verified at $nativeDir (${ptraceBinary.name})"))
+
+        val targetCmd = "echo VPORTABLE_ALPINE_BOOT_OK && uname -a && cat /etc/os-release"
+        val env = mapOf("PROOT_NO_SECCOMP" to "1")
+        val command = listOf(nativePtraceProbePath, rootfsDir.absolutePath, nativeDir, "/bin/sh", "-c", targetCmd)
+
+        val testCase = TestCase(
+            name = "Gate 6 V-Flash & Alpine Mini-Rootfs Boot Probe",
+            command = command,
+            env = env
+        )
+
+        emit(ProbeEvent.Log("\n[4/5] Executing ${testCase.name}: ${testCase.command.joinToString(" ")}"))
+
+        var bootMarkerFound = false
+        var osReleaseFound = false
+
+        val processResult = executeSubprocessSuspend(testCase.command, testCase.env) { logLine ->
+            emit(ProbeEvent.Log("  $logLine"))
+            if (logLine.contains("VPORTABLE_ALPINE_BOOT_OK")) {
+                bootMarkerFound = true
+            }
+            if (logLine.contains("NAME=\"Alpine Linux\"") || logLine.contains("Alpine Linux")) {
+                osReleaseFound = true
+            }
+        }
+
+        val success = processResult.exitCode == 0 && bootMarkerFound && osReleaseFound
+
+        if (success) {
+            emit(ProbeEvent.Log("  -> V-Flash Engine & Alpine Linux boot verified (SUCCESS)"))
+        } else {
+            val reason = processResult.failureBadge
+            emit(ProbeEvent.Log("  -> Subprocess failed with exit code ${processResult.exitCode} ($reason)"))
+        }
+
+        emit(ProbeEvent.Log("\n[5/5] Evaluating Gate 6 Feasibility Results..."))
+        if (success) {
+            emit(ProbeEvent.Log("SUCCESS: V-Flash Engine & Alpine Linux mini-rootfs boot validated."))
+            emit(ProbeEvent.Completed(true, "PASSED (V-FLASH & ALPINE BOOT)", true))
+        } else {
+            val badge = if (processResult.exitCode != 0) {
+                when (processResult.exitCode) {
+                    126 -> "FAILED: EPERM"
+                    127 -> "FAILED: ENOENT"
+                    139 -> "FAILED: SIGSEGV"
+                    159 -> "FAILED: SIGSYS"
+                    else -> "FAILED: EXIT_${processResult.exitCode}"
+                }
+            } else {
+                "FAILED: ALPINE_BOOT_FAILED"
             }
             emit(ProbeEvent.Log("FAILURE: $badge"))
             emit(ProbeEvent.Completed(false, badge, false))
