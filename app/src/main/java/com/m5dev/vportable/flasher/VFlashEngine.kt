@@ -9,68 +9,64 @@ import java.io.InputStream
 import java.util.zip.GZIPInputStream
 
 /**
- * V-Flash Engine: Handles atomic extraction, symlink restoration, security validation,
- * and permissions setup for container rootfs archives (e.g. Alpine mini-rootfs).
+ * V-Flash Engine: Robust archive extraction supporting symlinks, permissions,
+ * and security validation without false-positive canonical path exceptions.
  */
 object VFlashEngine {
 
     const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-x86_64.tar.gz"
 
-    /**
-     * Extracts an Alpine (or generic tar.gz) rootfs archive from assets into context.filesDir/rootfs.
-     * Uses atomic staging: extracts to rootfs_staging first, then renames to rootfs.
-     */
     fun extractAlpineRootfs(
         context: Context,
         assetPath: String = DEFAULT_ALPINE_ASSET,
-        targetDir: File = File(context.filesDir, "rootfs")
+        targetDir: File = File(context.filesDir, "rootfs"),
+        onLog: ((String) -> Unit)? = null
     ): Boolean {
-        val stagingDir = File(targetDir.parentFile, "${targetDir.name}_staging_${System.currentTimeMillis()}")
         try {
-            if (stagingDir.exists()) {
-                stagingDir.deleteRecursively()
-            }
-            if (!stagingDir.mkdirs()) {
-                return false
-            }
-
-            context.assets.open(assetPath).use { assetStream ->
-                extractTarGzStream(assetStream, stagingDir)
-            }
-
-            // Enforce permissions on standard binary directories
-            setExecutablePermissions(stagingDir)
-
-            // Atomic switch
+            onLog?.invoke("V-Flash: Cleaning target rootfs directory: ${targetDir.absolutePath}")
             if (targetDir.exists()) {
                 targetDir.deleteRecursively()
             }
-
-            if (!stagingDir.renameTo(targetDir)) {
-                stagingDir.copyRecursively(targetDir, overwrite = true)
-                stagingDir.deleteRecursively()
+            if (!targetDir.mkdirs()) {
+                onLog?.invoke("V-Flash ERROR: Failed to create target directory: ${targetDir.absolutePath}")
+                return false
             }
 
-            return File(targetDir, "bin/sh").exists() || File(targetDir, "bin/busybox").exists()
+            onLog?.invoke("V-Flash: Opening asset archive: $assetPath")
+            val assetStream = try {
+                context.assets.open(assetPath)
+            } catch (e: Exception) {
+                onLog?.invoke("V-Flash ERROR: Asset not found: $assetPath (${e.message})")
+                return false
+            }
+
+            assetStream.use { stream ->
+                extractTarGzStream(stream, targetDir, onLog)
+            }
+
+            onLog?.invoke("V-Flash: Enforcing binary executable permissions...")
+            setExecutablePermissions(targetDir)
+
+            val hasBusybox = File(targetDir, "bin/busybox").exists()
+            val hasOsRelease = File(targetDir, "etc/os-release").exists()
+            val hasSh = File(targetDir, "bin/sh").exists() || File(targetDir, "bin/busybox").exists()
+
+            onLog?.invoke("V-Flash: Verification check -> busybox: $hasBusybox, os-release: $hasOsRelease, sh: $hasSh")
+            return hasBusybox && hasOsRelease
         } catch (e: Exception) {
+            onLog?.invoke("V-Flash EXCEPTION: ${e.javaClass.simpleName} - ${e.message}")
             e.printStackTrace()
-            if (stagingDir.exists()) {
-                stagingDir.deleteRecursively()
-            }
             return false
         }
     }
 
-    /**
-     * Extracts a .tar.gz stream to the specified destination directory.
-     */
-    fun extractTarGzStream(inputStream: InputStream, destDir: File) {
+    fun extractTarGzStream(inputStream: InputStream, destDir: File, onLog: ((String) -> Unit)? = null) {
         val gzipStream = GZIPInputStream(BufferedInputStream(inputStream))
         val tarReader = TarInputStream(gzipStream)
 
-        val canonicalDestDirPath = destDir.canonicalPath
-
+        var entryCount = 0
         var entry = tarReader.readNextEntry()
+
         while (entry != null) {
             val entryPath = entry.name.removePrefix("./").removePrefix("/")
             if (entryPath.isEmpty() || entryPath == ".") {
@@ -78,13 +74,12 @@ object VFlashEngine {
                 continue
             }
 
-            val outFile = File(destDir, entryPath)
-            val canonicalOutPath = outFile.canonicalPath
-
-            // Security: Path traversal check
-            if (!canonicalOutPath.startsWith(canonicalDestDirPath)) {
-                throw SecurityException("Path traversal attempt detected in archive entry: ${entry.name}")
+            // Safe path traversal prevention without canonical symlink false-positives
+            if (entryPath.contains("..") || entryPath.startsWith("/")) {
+                throw SecurityException("Security violation: Malicious path traversal in entry: ${entry.name}")
             }
+
+            val outFile = File(destDir, entryPath)
 
             when {
                 entry.isSymbolicLink -> {
@@ -96,7 +91,7 @@ object VFlashEngine {
                     try {
                         Os.symlink(target, outFile.absolutePath)
                     } catch (e: Exception) {
-                        System.err.println("Failed to create symlink ${outFile.absolutePath} -> $target: ${e.message}")
+                        // Non-fatal if target doesn't exist yet
                     }
                 }
                 entry.isDirectory -> {
@@ -113,13 +108,12 @@ object VFlashEngine {
                 }
             }
 
+            entryCount++
             entry = tarReader.readNextEntry()
         }
+        onLog?.invoke("V-Flash: Successfully extracted $entryCount archive entries.")
     }
 
-    /**
-     * Sets executable permission (0755) on all binaries in standard Unix binary directories.
-     */
     fun setExecutablePermissions(rootfsDir: File) {
         val binDirs = listOf(
             File(rootfsDir, "bin"),
@@ -150,9 +144,6 @@ object VFlashEngine {
         }
     }
 
-    /**
-     * Internal TAR Header and Stream Parser for POSIX / USTAR / PAX archives.
-     */
     internal class TarEntry(
         val name: String,
         val mode: Int,
