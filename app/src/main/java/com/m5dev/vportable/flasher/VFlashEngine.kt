@@ -14,7 +14,7 @@ import java.util.zip.GZIPInputStream
  */
 object VFlashEngine {
 
-    const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-x86_64.tar.gz"
+    const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-x86_64.tar"
 
     /**
      * Extracts an Alpine (or generic tar.gz) rootfs archive directly into context.filesDir/rootfs.
