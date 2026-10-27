@@ -63,8 +63,19 @@ object VFlashEngine {
         destDir: File,
         onLog: ((String) -> Unit)? = null
     ) {
-        val gzipStream = GZIPInputStream(BufferedInputStream(inputStream))
-        val tarReader = TarInputStream(gzipStream)
+        val buffered = BufferedInputStream(inputStream)
+buffered.mark(2)
+val b1 = buffered.read()
+val b2 = buffered.read()
+buffered.reset()
+
+val decompressStream = if (b1 == 0x1f && b2 == 0x8b) {
+    GZIPInputStream(buffered)
+} else {
+    buffered // tar عادي مش مضغوط
+}
+
+val tarReader = TarInputStream(decompressStream)
 
         var entryCount = 0
         var symlinkCount = 0
