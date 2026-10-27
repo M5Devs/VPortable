@@ -20,7 +20,6 @@ class VFlashEngineTest {
     fun testExtractTarGzStream_simpleFileAndDir() {
         val destDir = tempFolder.newFolder("rootfs_test")
 
-        // Build a minimal TAR in memory
         val tarBytes = createMockTarGz(
             listOf(
                 MockTarEntry(name = "bin/", isDir = true),
@@ -28,21 +27,36 @@ class VFlashEngineTest {
             )
         )
 
-        VFlashEngine.extractTarGzStream(ByteArrayInputStream(tarBytes), destDir)
+        val logs = mutableListOf<String>()
+        VFlashEngine.extractTarGzStream(ByteArrayInputStream(tarBytes), destDir) { logs.add(it) }
 
         val helloFile = File(destDir, "bin/hello")
         assertTrue(helloFile.exists())
         assertEquals("echo Hello World\n", helloFile.readText())
         assertTrue(helloFile.canExecute())
+        assertTrue(logs.any { it.contains("Extracted") })
     }
 
     @Test(expected = SecurityException::class)
-    fun testExtractTarGzStream_rejectPathTraversal() {
-        val destDir = tempFolder.newFolder("rootfs_traversal")
+    fun testExtractTarGzStream_rejectPathTraversal_dotdot() {
+        val destDir = tempFolder.newFolder("rootfs_traversal_1")
 
         val tarBytes = createMockTarGz(
             listOf(
                 MockTarEntry(name = "../evil.txt", content = "malicious payload")
+            )
+        )
+
+        VFlashEngine.extractTarGzStream(ByteArrayInputStream(tarBytes), destDir)
+    }
+
+    @Test(expected = SecurityException::class)
+    fun testExtractTarGzStream_rejectPathTraversal_absolute() {
+        val destDir = tempFolder.newFolder("rootfs_traversal_2")
+
+        val tarBytes = createMockTarGz(
+            listOf(
+                MockTarEntry(name = "/etc/passwd", content = "malicious payload")
             )
         )
 

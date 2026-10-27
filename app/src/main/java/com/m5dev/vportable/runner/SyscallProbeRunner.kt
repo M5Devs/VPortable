@@ -603,8 +603,22 @@ class SyscallProbeRunner(private val context: Context) {
         val nativeDir = context.applicationInfo.nativeLibraryDir
         val nativePtraceProbePath = "$nativeDir/libprobe_ptrace.so"
 
+        val rootfsAssets = context.assets?.list("rootfs")?.toList() ?: emptyList()
+        emit(ProbeEvent.Log("       Assets in 'rootfs/': $rootfsAssets"))
+
         emit(ProbeEvent.Log("[1/5] Extracting Alpine mini-rootfs tarball via VFlashEngine..."))
-        val extractSuccess = VFlashEngine.extractAlpineRootfs(context, VFlashEngine.DEFAULT_ALPINE_ASSET, rootfsDir)
+        val extractionLogs = mutableListOf<String>()
+        val extractSuccess = VFlashEngine.extractAlpineRootfs(
+            context,
+            VFlashEngine.DEFAULT_ALPINE_ASSET,
+            rootfsDir
+        ) { logMsg ->
+            extractionLogs.add(logMsg)
+        }
+
+        for (logMsg in extractionLogs) {
+            emit(ProbeEvent.Log("       $logMsg"))
+        }
 
         if (!extractSuccess) {
             emit(ProbeEvent.Log("ERROR: VFlashEngine rootfs extraction failed or missing essential binaries."))
@@ -613,13 +627,13 @@ class SyscallProbeRunner(private val context: Context) {
         }
         emit(ProbeEvent.Log("       Rootfs extracted successfully to: ${rootfsDir.absolutePath}"))
 
-        emit(ProbeEvent.Log("[2/5] Verifying extracted Alpine files (/bin/sh and /etc/os-release)..."))
-        val binSh = File(rootfsDir, "bin/sh")
+        emit(ProbeEvent.Log("[2/5] Verifying extracted Alpine files (/bin/busybox and /etc/os-release)..."))
+        val busybox = File(rootfsDir, "bin/busybox")
         val osRelease = File(rootfsDir, "etc/os-release")
 
-        if (!binSh.exists()) {
-            emit(ProbeEvent.Log("ERROR: Target /bin/sh missing in extracted rootfs"))
-            emit(ProbeEvent.Completed(false, "FAILED: ENOENT (/bin/sh)", false))
+        if (!busybox.exists()) {
+            emit(ProbeEvent.Log("ERROR: Target /bin/busybox missing in extracted rootfs"))
+            emit(ProbeEvent.Completed(false, "FAILED: ENOENT (/bin/busybox)", false))
             return@flow
         }
 
@@ -629,7 +643,7 @@ class SyscallProbeRunner(private val context: Context) {
             return@flow
         }
 
-        emit(ProbeEvent.Log("       /bin/sh verified: ${binSh.absolutePath}"))
+        emit(ProbeEvent.Log("       /bin/busybox verified: ${busybox.absolutePath}"))
         emit(ProbeEvent.Log("       /etc/os-release verified: ${osRelease.absolutePath}"))
 
         val ptraceBinary = File(nativePtraceProbePath)

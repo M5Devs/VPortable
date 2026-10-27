@@ -9,7 +9,7 @@ import java.io.InputStream
 import java.util.zip.GZIPInputStream
 
 /**
- * V-Flash Engine: Handles atomic extraction, symlink restoration, security validation,
+ * V-Flash Engine: Handles extraction, symlink restoration, security validation,
  * and permissions setup for container rootfs archives (e.g. Alpine mini-rootfs).
  */
 object VFlashEngine {
@@ -17,61 +17,65 @@ object VFlashEngine {
     const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-x86_64.tar.gz"
 
     /**
-     * Extracts an Alpine (or generic tar.gz) rootfs archive from assets into context.filesDir/rootfs.
-     * Uses atomic staging: extracts to rootfs_staging first, then renames to rootfs.
+     * Extracts an Alpine (or generic tar.gz) rootfs archive directly into context.filesDir/rootfs.
      */
     fun extractAlpineRootfs(
         context: Context,
         assetPath: String = DEFAULT_ALPINE_ASSET,
-        targetDir: File = File(context.filesDir, "rootfs")
+        targetDir: File = File(context.filesDir, "rootfs"),
+        onLog: ((String) -> Unit)? = null
     ): Boolean {
-        val stagingDir = File(targetDir.parentFile, "${targetDir.name}_staging_${System.currentTimeMillis()}")
         try {
-            if (stagingDir.exists()) {
-                stagingDir.deleteRecursively()
-            }
-            if (!stagingDir.mkdirs()) {
-                return false
-            }
-
-            context.assets.open(assetPath).use { assetStream ->
-                extractTarGzStream(assetStream, stagingDir)
-            }
-
-            // Enforce permissions on standard binary directories
-            setExecutablePermissions(stagingDir)
-
-            // Atomic switch
+            onLog?.invoke("Preparing target directory: ${targetDir.absolutePath}")
             if (targetDir.exists()) {
                 targetDir.deleteRecursively()
             }
-
-            if (!stagingDir.renameTo(targetDir)) {
-                stagingDir.copyRecursively(targetDir, overwrite = true)
-                stagingDir.deleteRecursively()
+            if (!targetDir.mkdirs()) {
+                onLog?.invoke("ERROR: Failed to create target directory")
+                return false
             }
 
-            return File(targetDir, "bin/sh").exists() || File(targetDir, "bin/busybox").exists()
+            onLog?.invoke("Opening asset: $assetPath")
+            context.assets.open(assetPath).use { assetStream ->
+                extractTarGzStream(assetStream, targetDir, onLog)
+            }
+
+            onLog?.invoke("Enforcing executable permissions on /bin, /sbin, /usr/bin, /usr/sbin...")
+            setExecutablePermissions(targetDir)
+
+            val hasBusybox = File(targetDir, "bin/busybox").exists()
+            val hasOsRelease = File(targetDir, "etc/os-release").exists()
+
+            onLog?.invoke("Verification check: bin/busybox exists=$hasBusybox, etc/os-release exists=$hasOsRelease")
+            return hasBusybox && hasOsRelease
         } catch (e: Exception) {
+            onLog?.invoke("ERROR during rootfs extraction: ${e.javaClass.simpleName} - ${e.message}")
             e.printStackTrace()
-            if (stagingDir.exists()) {
-                stagingDir.deleteRecursively()
-            }
             return false
         }
     }
 
     /**
-     * Extracts a .tar.gz stream to the specified destination directory.
+     * Extracts a .tar.gz stream to the specified destination directory directly.
      */
-    fun extractTarGzStream(inputStream: InputStream, destDir: File) {
+    fun extractTarGzStream(
+        inputStream: InputStream,
+        destDir: File,
+        onLog: ((String) -> Unit)? = null
+    ) {
         val gzipStream = GZIPInputStream(BufferedInputStream(inputStream))
         val tarReader = TarInputStream(gzipStream)
 
-        val canonicalDestDirPath = destDir.canonicalPath
+        var entryCount = 0
+        var symlinkCount = 0
 
         var entry = tarReader.readNextEntry()
         while (entry != null) {
+            // Security: Path traversal check
+            if (entry.name.startsWith("/") || entry.name.contains("..")) {
+                throw SecurityException("Malicious path traversal entry: ${entry.name}")
+            }
+
             val entryPath = entry.name.removePrefix("./").removePrefix("/")
             if (entryPath.isEmpty() || entryPath == ".") {
                 entry = tarReader.readNextEntry()
@@ -79,12 +83,6 @@ object VFlashEngine {
             }
 
             val outFile = File(destDir, entryPath)
-            val canonicalOutPath = outFile.canonicalPath
-
-            // Security: Path traversal check
-            if (!canonicalOutPath.startsWith(canonicalDestDirPath)) {
-                throw SecurityException("Path traversal attempt detected in archive entry: ${entry.name}")
-            }
 
             when {
                 entry.isSymbolicLink -> {
@@ -95,8 +93,9 @@ object VFlashEngine {
                     val target = entry.linkName
                     try {
                         Os.symlink(target, outFile.absolutePath)
+                        symlinkCount++
                     } catch (e: Exception) {
-                        System.err.println("Failed to create symlink ${outFile.absolutePath} -> $target: ${e.message}")
+                        onLog?.invoke("Failed symlink ${outFile.name} -> $target: ${e.message}")
                     }
                 }
                 entry.isDirectory -> {
@@ -113,8 +112,11 @@ object VFlashEngine {
                 }
             }
 
+            entryCount++
             entry = tarReader.readNextEntry()
         }
+
+        onLog?.invoke("Extracted $entryCount entries ($symlinkCount symlinks recreated)")
     }
 
     /**
