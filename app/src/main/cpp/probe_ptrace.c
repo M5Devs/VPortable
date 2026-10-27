@@ -523,19 +523,7 @@ int main(int argc, char *argv[]) {
                                     char full_virtual[1024] = {0};
                                     resolve_relative_or_absolute(raw_path, ps->cwd, full_virtual, sizeof(full_virtual));
 
-                                    char rew_path[2048] = {0};
-                                    struct stat st;
-                                    int resolved = resolve_vfs_path(full_virtual, rew_path, sizeof(rew_path));
-                                    if (resolved && (stat(rew_path, &st) == 0 || lstat(rew_path, &st) == 0)) {
-                                        uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
-                                        if (scr != 0) {
-                                            SET_ARCH_ARG1(regs, scr);
-                                            set_child_regs(cur_pid, &regs);
-                                            printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s\n",
-                                                   cur_pid, full_virtual, rew_path);
-                                            fflush(stdout);
-                                        }
-                                    } else if (strncmp(full_virtual, "/bin/", 5) == 0) {
+                                    if (strncmp(full_virtual, "/bin/", 5) == 0) {
                                         const char *applet = full_virtual + 5;
                                         char busybox_path[2048] = {0};
                                         snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", native_lib_dir);
@@ -547,6 +535,20 @@ int main(int argc, char *argv[]) {
                                             printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s (applet=%s)\n",
                                                    cur_pid, full_virtual, busybox_path, applet);
                                             fflush(stdout);
+                                        }
+                                    } else {
+                                        char rew_path[2048] = {0};
+                                        struct stat st;
+                                        int resolved = resolve_vfs_path(full_virtual, rew_path, sizeof(rew_path));
+                                        if (resolved && (stat(rew_path, &st) == 0 || lstat(rew_path, &st) == 0)) {
+                                            uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
+                                            if (scr != 0) {
+                                                SET_ARCH_ARG1(regs, scr);
+                                                set_child_regs(cur_pid, &regs);
+                                                printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s\n",
+                                                       cur_pid, full_virtual, rew_path);
+                                                fflush(stdout);
+                                            }
                                         }
                                     }
                                 }

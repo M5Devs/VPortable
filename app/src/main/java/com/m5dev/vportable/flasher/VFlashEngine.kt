@@ -14,7 +14,7 @@ import java.util.zip.GZIPInputStream
  */
 object VFlashEngine {
 
-    const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-x86_64.tar"
+    const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-x86_64.tar.gz"
 
     /**
      * Extracts an Alpine (or generic tar.gz) rootfs archive directly into context.filesDir/rootfs.
@@ -63,19 +63,8 @@ object VFlashEngine {
         destDir: File,
         onLog: ((String) -> Unit)? = null
     ) {
-        val buffered = BufferedInputStream(inputStream)
-buffered.mark(2)
-val b1 = buffered.read()
-val b2 = buffered.read()
-buffered.reset()
-
-val decompressStream = if (b1 == 0x1f && b2 == 0x8b) {
-    GZIPInputStream(buffered)
-} else {
-    buffered // tar عادي مش مضغوط
-}
-
-val tarReader = TarInputStream(decompressStream)
+        val gzipStream = GZIPInputStream(BufferedInputStream(inputStream))
+        val tarReader = TarInputStream(gzipStream)
 
         var entryCount = 0
         var symlinkCount = 0
