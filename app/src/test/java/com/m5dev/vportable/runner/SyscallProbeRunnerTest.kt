@@ -169,4 +169,24 @@ class SyscallProbeRunnerTest {
         assertTrue(binDir.exists())
         assertTrue(libDir.exists())
     }
+
+    @Test
+    fun testRunGate6AlpineProbe_missingNativeBinary() = runTest {
+        val filesDir = tempFolder.newFolder("files_g6")
+        val nativeDir = tempFolder.newFolder("lib_g6")
+
+        val appInfo = ApplicationInfo().apply {
+            nativeLibraryDir = nativeDir.absolutePath
+        }
+
+        val mockContext = mock<Context>()
+        whenever(mockContext.filesDir).thenReturn(filesDir)
+        whenever(mockContext.applicationInfo).thenReturn(appInfo)
+
+        val runner = SyscallProbeRunner(mockContext)
+        val events = runner.runGate6AlpineProbe().toList()
+
+        val completedEvent = events.last() as ProbeEvent.Completed
+        assertFalse(completedEvent.success)
+    }
 }

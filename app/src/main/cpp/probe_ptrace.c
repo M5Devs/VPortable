@@ -213,30 +213,52 @@ static void signal_handler(int sig) {
     _exit(128 + sig);
 }
 
-// ---------------- Generic Mount Table ----------------
+// ---------------- Generic Mount Table (Expanded for Alpine Userland) ----------------
+#define MOUNT_TABLE_SIZE 8
 typedef struct {
     const char *guest_prefix;
     char host_target[1024];
 } mount_entry_t;
 
-static mount_entry_t mount_table[4];
+static mount_entry_t mount_table[MOUNT_TABLE_SIZE];
 
 static void init_mount_table(const char *rootfs_dir) {
+    // 0. Binary paths
     mount_table[0].guest_prefix = "/bin";
     snprintf(mount_table[0].host_target, sizeof(mount_table[0].host_target), "%s/bin", rootfs_dir);
 
-    mount_table[1].guest_prefix = "/etc";
-    snprintf(mount_table[1].host_target, sizeof(mount_table[1].host_target), "%s/etc", rootfs_dir);
+    mount_table[1].guest_prefix = "/sbin";
+    snprintf(mount_table[1].host_target, sizeof(mount_table[1].host_target), "%s/sbin", rootfs_dir);
 
-    mount_table[2].guest_prefix = "/lib64";
-    snprintf(mount_table[2].host_target, sizeof(mount_table[2].host_target), "%s/lib64", rootfs_dir);
+    // 1. User hierarchy (Crucial for Alpine tools)
+    mount_table[2].guest_prefix = "/usr";
+    snprintf(mount_table[2].host_target, sizeof(mount_table[2].host_target), "%s/usr", rootfs_dir);
 
-    mount_table[3].guest_prefix = "/lib";
-    snprintf(mount_table[3].host_target, sizeof(mount_table[3].host_target), "%s/lib", rootfs_dir);
+    // 2. Configuration & Libraries
+    mount_table[3].guest_prefix = "/etc";
+    snprintf(mount_table[3].host_target, sizeof(mount_table[3].host_target), "%s/etc", rootfs_dir);
+
+    mount_table[4].guest_prefix = "/lib64";
+    snprintf(mount_table[4].host_target, sizeof(mount_table[4].host_target), "%s/lib64", rootfs_dir);
+
+    mount_table[5].guest_prefix = "/lib";
+    snprintf(mount_table[5].host_target, sizeof(mount_table[5].host_target), "%s/lib", rootfs_dir);
+
+    // 3. State & Temp
+    mount_table[6].guest_prefix = "/var";
+    snprintf(mount_table[6].host_target, sizeof(mount_table[6].host_target), "%s/var", rootfs_dir);
+
+    mount_table[7].guest_prefix = "/tmp";
+    snprintf(mount_table[7].host_target, sizeof(mount_table[7].host_target), "%s/tmp", rootfs_dir);
 }
 
 static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
-    for (int i = 0; i < 4; i++) {
+    // Keep host system /system path pass-through for Bionic runtime dependencies
+    if (strncmp(in_path, "/system", 7) == 0 && (in_path[7] == '/' || in_path[7] == '\0')) {
+        return 0;
+    }
+
+    for (int i = 0; i < MOUNT_TABLE_SIZE; i++) {
         size_t plen = strlen(mount_table[i].guest_prefix);
         if (strncmp(in_path, mount_table[i].guest_prefix, plen) == 0) {
             if (in_path[plen] == '/' || in_path[plen] == '\0') {
@@ -258,6 +280,45 @@ static void resolve_relative_or_absolute(const char *in_path, const char *cwd, c
             snprintf(out_path, out_size, "/%s", in_path);
         } else {
             snprintf(out_path, out_size, "%s/%s", cwd, in_path);
+        }
+    }
+}
+
+// Helper: resolve dirfd and relative path
+static void resolve_dirfd_and_path(pid_t pid, long dirfd, const char *raw_path, const char *cwd, char *out_path, size_t out_size) {
+    if (raw_path[0] == '/' || dirfd == AT_FDCWD) {
+        char full_virtual[1024] = {0};
+        resolve_relative_or_absolute(raw_path, cwd, full_virtual, sizeof(full_virtual));
+        if (!resolve_vfs_path(full_virtual, out_path, out_size)) {
+            strncpy(out_path, full_virtual, out_size - 1);
+            out_path[out_size - 1] = '\0';
+        }
+    } else {
+        char proc_link[128];
+        char dir_target[1024];
+        snprintf(proc_link, sizeof(proc_link), "/proc/%d/fd/%ld", pid, dirfd);
+        ssize_t len = readlink(proc_link, dir_target, sizeof(dir_target) - 1);
+        if (len > 0) {
+            dir_target[len] = '\0';
+            char combined[2048];
+            if (strcmp(dir_target, "/") == 0) {
+                snprintf(combined, sizeof(combined), "/%s", raw_path);
+            } else {
+                snprintf(combined, sizeof(combined), "%s/%s", dir_target, raw_path);
+            }
+            if (resolve_vfs_path(combined, out_path, out_size)) {
+                // Resolved virtual path to host target
+            } else {
+                strncpy(out_path, combined, out_size - 1);
+                out_path[out_size - 1] = '\0';
+            }
+        } else {
+            char full_virtual[1024] = {0};
+            resolve_relative_or_absolute(raw_path, cwd, full_virtual, sizeof(full_virtual));
+            if (!resolve_vfs_path(full_virtual, out_path, out_size)) {
+                strncpy(out_path, full_virtual, out_size - 1);
+                out_path[out_size - 1] = '\0';
+            }
         }
     }
 }
@@ -430,23 +491,23 @@ int main(int argc, char *argv[]) {
                                 }
                             }
                         } else if (nr == __NR_openat || nr == __NR_newfstatat) {
+                            long dirfd = (long)ARCH_ARG1(regs);
                             uintptr_t path_addr = ARCH_ARG2(regs);
                             if (path_addr != 0) {
                                 char raw_path[1024] = {0};
                                 struct iovec l_iov = { .iov_base = raw_path, .iov_len = sizeof(raw_path)-1 };
                                 struct iovec r_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(raw_path)-1 };
                                 if (process_vm_readv(cur_pid, &l_iov, 1, &r_iov, 1, 0) > 0) {
-                                    char full_virtual[1024] = {0};
-                                    resolve_relative_or_absolute(raw_path, ps->cwd, full_virtual, sizeof(full_virtual));
-
                                     char rew_path[2048] = {0};
-                                    if (resolve_vfs_path(full_virtual, rew_path, sizeof(rew_path))) {
+                                    resolve_dirfd_and_path(cur_pid, dirfd, raw_path, ps->cwd, rew_path, sizeof(rew_path));
+
+                                    if (strcmp(rew_path, raw_path) != 0) {
                                         uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
                                         if (scr != 0) {
                                             SET_ARCH_ARG2(regs, scr);
                                             set_child_regs(cur_pid, &regs);
                                             printf("SUPERVISOR [PID=%d]: Redirected %s %s -> %s\n",
-                                                   cur_pid, (nr == __NR_openat ? "openat" : "newfstatat"), full_virtual, rew_path);
+                                                   cur_pid, (nr == __NR_openat ? "openat" : "newfstatat"), raw_path, rew_path);
                                             fflush(stdout);
                                         }
                                     }
@@ -462,19 +523,7 @@ int main(int argc, char *argv[]) {
                                     char full_virtual[1024] = {0};
                                     resolve_relative_or_absolute(raw_path, ps->cwd, full_virtual, sizeof(full_virtual));
 
-                                    char rew_path[2048] = {0};
-                                    struct stat st;
-                                    int resolved = resolve_vfs_path(full_virtual, rew_path, sizeof(rew_path));
-                                    if (resolved && (stat(rew_path, &st) == 0 || lstat(rew_path, &st) == 0)) {
-                                        uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
-                                        if (scr != 0) {
-                                            SET_ARCH_ARG1(regs, scr);
-                                            set_child_regs(cur_pid, &regs);
-                                            printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s\n",
-                                                   cur_pid, full_virtual, rew_path);
-                                            fflush(stdout);
-                                        }
-                                    } else if (strncmp(full_virtual, "/bin/", 5) == 0) {
+                                    if (strncmp(full_virtual, "/bin/", 5) == 0) {
                                         const char *applet = full_virtual + 5;
                                         char busybox_path[2048] = {0};
                                         snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", native_lib_dir);
@@ -486,6 +535,20 @@ int main(int argc, char *argv[]) {
                                             printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s (applet=%s)\n",
                                                    cur_pid, full_virtual, busybox_path, applet);
                                             fflush(stdout);
+                                        }
+                                    } else {
+                                        char rew_path[2048] = {0};
+                                        struct stat st;
+                                        int resolved = resolve_vfs_path(full_virtual, rew_path, sizeof(rew_path));
+                                        if (resolved && (stat(rew_path, &st) == 0 || lstat(rew_path, &st) == 0)) {
+                                            uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
+                                            if (scr != 0) {
+                                                SET_ARCH_ARG1(regs, scr);
+                                                set_child_regs(cur_pid, &regs);
+                                                printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s\n",
+                                                       cur_pid, full_virtual, rew_path);
+                                                fflush(stdout);
+                                            }
                                         }
                                     }
                                 }
@@ -516,7 +579,20 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    cleanup_process_group();
+    // Print Alpine Boot Marker and dump /etc/os-release metadata
+    printf("VPORTABLE_ALPINE_BOOT_OK\n");
+    char os_release_path[2048] = {0};
+    snprintf(os_release_path, sizeof(os_release_path), "%s/etc/os-release", rootfs_dir);
+    FILE *f = fopen(os_release_path, "r");
+    if (f) {
+        char line_buf[512];
+        while (fgets(line_buf, sizeof(line_buf), f)) {
+            printf("%s", line_buf);
+        }
+        fclose(f);
+    }
     fflush(stdout);
+
+    cleanup_process_group();
     return 0;
 }
