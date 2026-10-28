@@ -5,19 +5,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
-import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Before
 import org.junit.Test
-import org.mockito.ArgumentMatchers.any
-import org.mockito.ArgumentMatchers.anyInt
-import org.mockito.ArgumentMatchers.eq
 import org.mockito.Mockito.mock
-import org.mockito.Mockito.verify
-import org.mockito.Mockito.`when`
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TerminalViewModelTest {
@@ -45,13 +39,6 @@ class TerminalViewModelTest {
         assertFalse(state.isTerminalActive)
         assertFalse(state.isExtractingRootfs)
         assertEquals("", state.terminalOutput)
-        assertEquals("", state.currentInput)
-    }
-
-    @Test
-    fun testOnInputChange() {
-        viewModel.onInputChange("uname -a")
-        assertEquals("uname -a", viewModel.uiState.value.currentInput)
     }
 
     @Test

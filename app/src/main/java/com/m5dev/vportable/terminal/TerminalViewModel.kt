@@ -18,7 +18,6 @@ data class TerminalUiState(
     val isTerminalActive: Boolean = false,
     val isExtractingRootfs: Boolean = false,
     val terminalOutput: String = "",
-    val currentInput: String = "",
     val statusMessage: String = "PTY Inactive"
 )
 
@@ -91,25 +90,32 @@ class TerminalViewModel @JvmOverloads constructor(
             readJob = launch {
                 bridge.readStream(masterFd).collect { text ->
                     _uiState.value = _uiState.value.copy(
-                        terminalOutput = _uiState.value.terminalOutput + text
+                        terminalOutput = _uiState.value.terminalOutput + processAnsi(text)
                     )
                 }
             }
         }
     }
 
-    fun onInputChange(newInput: String) {
-        _uiState.value = _uiState.value.copy(currentInput = newInput)
+    private fun processAnsi(rawText: String): String {
+        // Strip ANSI escape codes for clean monospaced rendering
+        return rawText.replace(Regex("\u001B\\[[;\\d]*[A-Za-z]"), "")
     }
 
-    fun sendInput(text: String = _uiState.value.currentInput) {
+    fun sendRawInput(text: String) {
         if (masterFd < 0 || !_uiState.value.isTerminalActive) return
-        val commandText = if (text.endsWith("\n")) text else "$text\n"
-        val payload = commandText.toByteArray()
+        val payload = text.toByteArray()
         viewModelScope.launch(Dispatchers.IO) {
             bridge.nativeWrite(masterFd, payload, payload.size)
         }
-        _uiState.value = _uiState.value.copy(currentInput = "")
+    }
+
+    fun sendEnter() {
+        sendBytes(byteArrayOf(0x0D)) // '\r'
+    }
+
+    fun sendBackspace() {
+        sendBytes(byteArrayOf(0x7F)) // DEL / Backspace
     }
 
     fun sendCtrlC() {

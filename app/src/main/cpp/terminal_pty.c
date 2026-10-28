@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <jni.h>
 #include <pty.h>
 #include <unistd.h>
@@ -44,28 +43,47 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
     }
 
     if (pid == 0) {
-        // Child Process: Launch our VFS Supervisor inside the PTY!
-        char supervisor_path[1024];
-        snprintf(supervisor_path, sizeof(supervisor_path), "%s/libprobe_ptrace.so", c_native_dir ? c_native_dir : "");
-
-        char *supervisor_args[] = {
-            supervisor_path,
-            (char*)c_rootfs,
-            (char*)c_native_dir,
-            "/bin/sh",
-            "-i",
-            NULL
-        };
+        // Child Process: setup environment & execute VFS supervisor /bin/sh -i
+        if (c_rootfs && strlen(c_rootfs) > 0) {
+            chdir(c_rootfs);
+        }
 
         setenv("TERM", "xterm-256color", 1);
         setenv("HOME", "/root", 1);
         setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/system/bin", 1);
         setenv("PROOT_NO_SECCOMP", "1", 1);
 
-        LOGI("Child launching VFS Supervisor in PTY: %s", supervisor_path);
-        execv(supervisor_path, supervisor_args);
+        char supervisor_path[1024];
+        snprintf(supervisor_path, sizeof(supervisor_path), "%s/libprobe_ptrace.so", c_native_dir ? c_native_dir : "");
 
-        LOGE("execv supervisor failed: %s", strerror(errno));
+        char *supervisor_args[] = {
+            supervisor_path,
+            (char *) c_rootfs,
+            (char *) c_native_dir,
+            "/bin/sh",
+            "-i",
+            NULL
+        };
+
+        if (access(supervisor_path, R_OK | X_OK) == 0) {
+            LOGI("Child executing supervisor: %s %s %s /bin/sh -i", supervisor_path, c_rootfs, c_native_dir);
+            execv(supervisor_path, supervisor_args);
+        }
+
+        char busybox_path[1024];
+        snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", c_native_dir ? c_native_dir : "");
+        char *sh_args[] = { "sh", "-i", NULL };
+
+        if (access(busybox_path, R_OK | X_OK) == 0) {
+            LOGI("Child executing busybox interactive shell: %s sh -i", busybox_path);
+            execv(busybox_path, sh_args);
+        }
+
+        // Fallback to system shell
+        LOGI("Child executing system shell: /system/bin/sh -i");
+        execv("/system/bin/sh", sh_args);
+
+        LOGE("exec failed: %s", strerror(errno));
         _exit(127);
     }
 
@@ -105,7 +123,7 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeRead(
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return 0; // No data available right now (non-blocking)
         }
-        return -1; // Genuine error / EIO (closed)
+        return -1; // Genuine error
     }
 
     if (bytes_read == 0) {
