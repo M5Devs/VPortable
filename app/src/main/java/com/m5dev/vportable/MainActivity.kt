@@ -26,11 +26,18 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
+import androidx.compose.material3.TabRowDefaults
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -38,10 +45,13 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.m5dev.vportable.terminal.TerminalScreen
+import com.m5dev.vportable.terminal.TerminalViewModel
 
 class MainActivity : ComponentActivity() {
 
-    private val viewModel: MainViewModel by viewModels()
+    private val mainViewModel: MainViewModel by viewModels()
+    private val terminalViewModel: TerminalViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,11 +61,57 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = Color(0xFF121212)
                 ) {
-                    val state by viewModel.uiState.collectAsState()
-                    Gate1TestHarnessScreen(
-                        state = state,
-                        onRunTest = { viewModel.runSyscallTest() }
-                    )
+                    var selectedTabIndex by remember { mutableIntStateOf(0) }
+
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        TabRow(
+                            selectedTabIndex = selectedTabIndex,
+                            containerColor = Color(0xFF1E1E1E),
+                            contentColor = Color.White,
+                            indicator = { tabPositions ->
+                                TabRowDefaults.SecondaryIndicator(
+                                    Modifier.tabIndicatorOffset(tabPositions[selectedTabIndex]),
+                                    color = Color(0xFF69F0AE)
+                                )
+                            }
+                        ) {
+                            Tab(
+                                selected = selectedTabIndex == 0,
+                                onClick = { selectedTabIndex = 0 },
+                                text = {
+                                    Text(
+                                        "Test Harness",
+                                        fontWeight = if (selectedTabIndex == 0) FontWeight.Bold else FontWeight.Normal,
+                                        color = if (selectedTabIndex == 0) Color(0xFF69F0AE) else Color.LightGray
+                                    )
+                                }
+                            )
+                            Tab(
+                                selected = selectedTabIndex == 1,
+                                onClick = { selectedTabIndex = 1 },
+                                text = {
+                                    Text(
+                                        "Interactive Terminal",
+                                        fontWeight = if (selectedTabIndex == 1) FontWeight.Bold else FontWeight.Normal,
+                                        color = if (selectedTabIndex == 1) Color(0xFF69F0AE) else Color.LightGray
+                                    )
+                                }
+                            )
+                        }
+
+                        when (selectedTabIndex) {
+                            0 -> {
+                                val state by mainViewModel.uiState.collectAsState()
+                                Gate1TestHarnessScreen(
+                                    state = state,
+                                    onRunTest = { mainViewModel.runSyscallTest() }
+                                )
+                            }
+                            1 -> {
+                                TerminalScreen(viewModel = terminalViewModel)
+                            }
+                        }
+                    }
                 }
             }
         }
