@@ -43,7 +43,7 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
     }
 
     if (pid == 0) {
-        // Child Process: setup environment & run interactive shell
+        // Child Process: setup environment & run persistent interactive shell
         if (c_rootfs && strlen(c_rootfs) > 0) {
             chdir(c_rootfs);
         }
@@ -53,27 +53,20 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
         setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/system/bin", 1);
         setenv("PROOT_NO_SECCOMP", "1", 1);
 
-        char supervisor_path[1024];
         char busybox_path[1024];
-
-        snprintf(supervisor_path, sizeof(supervisor_path), "%s/libprobe_ptrace.so", c_native_dir ? c_native_dir : "");
         snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", c_native_dir ? c_native_dir : "");
 
-        // Try launching via VFS supervisor first if available
-        if (access(supervisor_path, X_OK) == 0) {
-            LOGI("Child executing supervisor: %s %s %s /bin/sh -i", supervisor_path, c_rootfs, c_native_dir);
-            execl(supervisor_path, supervisor_path, c_rootfs, c_native_dir, "/bin/sh", "-i", (char *) NULL);
-        }
+        char *sh_args[] = { "sh", "-i", NULL };
 
-        // Fallback to BusyBox directly
-        if (access(busybox_path, X_OK) == 0) {
-            LOGI("Child executing busybox: %s sh -i", busybox_path);
-            execl(busybox_path, "sh", "-i", (char *) NULL);
+        // Execute BusyBox interactive shell as "sh -i"
+        if (access(busybox_path, R_OK | X_OK) == 0) {
+            LOGI("Child executing busybox interactive shell: %s sh -i", busybox_path);
+            execv(busybox_path, sh_args);
         }
 
         // Fallback to system shell
         LOGI("Child executing system shell: /system/bin/sh -i");
-        execl("/system/bin/sh", "sh", "-i", (char *) NULL);
+        execv("/system/bin/sh", sh_args);
 
         LOGE("exec failed: %s", strerror(errno));
         _exit(127);

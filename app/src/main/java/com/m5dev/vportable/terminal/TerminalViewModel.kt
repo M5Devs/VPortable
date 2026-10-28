@@ -104,7 +104,8 @@ class TerminalViewModel @JvmOverloads constructor(
 
     fun sendInput(text: String = _uiState.value.currentInput) {
         if (masterFd < 0 || !_uiState.value.isTerminalActive) return
-        val payload = (text + "\n").toByteArray()
+        val commandText = if (text.endsWith("\n")) text else "$text\n"
+        val payload = commandText.toByteArray()
         viewModelScope.launch(Dispatchers.IO) {
             bridge.nativeWrite(masterFd, payload, payload.size)
         }

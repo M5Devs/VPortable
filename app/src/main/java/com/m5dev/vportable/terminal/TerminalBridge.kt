@@ -32,10 +32,10 @@ class TerminalBridge {
                 val text = String(buffer, 0, bytesRead)
                 emit(text)
             } else if (bytesRead == 0) {
-                // Non-blocking read, no data currently available
-                delay(20)
+                // Non-blocking read, delay briefly to avoid busy-waiting
+                delay(10)
             } else {
-                // EOF or masterFd error
+                // EOF or masterFd closed
                 break
             }
         }
