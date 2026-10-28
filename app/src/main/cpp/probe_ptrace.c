@@ -579,7 +579,20 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    cleanup_process_group();
+    // Print Alpine Boot Marker and dump /etc/os-release metadata
+    printf("VPORTABLE_ALPINE_BOOT_OK\n");
+    char os_release_path[2048] = {0};
+    snprintf(os_release_path, sizeof(os_release_path), "%s/etc/os-release", rootfs_dir);
+    FILE *f = fopen(os_release_path, "r");
+    if (f) {
+        char line_buf[512];
+        while (fgets(line_buf, sizeof(line_buf), f)) {
+            printf("%s", line_buf);
+        }
+        fclose(f);
+    }
     fflush(stdout);
+
+    cleanup_process_group();
     return 0;
 }
