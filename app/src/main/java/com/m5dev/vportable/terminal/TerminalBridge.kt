@@ -29,7 +29,7 @@ class TerminalBridge {
         while (true) {
             val bytesRead = nativeRead(masterFd, buffer)
             if (bytesRead > 0) {
-                val text = String(buffer, 0, bytesRead, Charsets.UTF_8)
+                val text = String(buffer, 0, bytesRead)
                 emit(text)
             } else if (bytesRead == 0) {
                 // Non-blocking read, no data currently available

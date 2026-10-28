@@ -22,7 +22,7 @@ data class TerminalUiState(
     val statusMessage: String = "PTY Inactive"
 )
 
-class TerminalViewModel(
+class TerminalViewModel @JvmOverloads constructor(
     application: Application,
     private val bridge: TerminalBridge = TerminalBridge()
 ) : AndroidViewModel(application) {
@@ -104,7 +104,7 @@ class TerminalViewModel(
 
     fun sendInput(text: String = _uiState.value.currentInput) {
         if (masterFd < 0 || !_uiState.value.isTerminalActive) return
-        val payload = (text + "\n").toByteArray(Charsets.UTF_8)
+        val payload = (text + "\n").toByteArray()
         viewModelScope.launch(Dispatchers.IO) {
             bridge.nativeWrite(masterFd, payload, payload.size)
         }
