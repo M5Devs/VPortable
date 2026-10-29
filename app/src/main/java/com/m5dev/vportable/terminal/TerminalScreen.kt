@@ -1,9 +1,12 @@
 package com.m5dev.vportable.terminal
 
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -13,8 +16,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -23,8 +28,6 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -36,15 +39,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -60,68 +66,83 @@ fun TerminalScreen(
 
     var textFieldValue by remember { mutableStateOf(TextFieldValue("")) }
 
+    // Blinking cursor animation (Termux style █)
+    val infiniteTransition = rememberInfiniteTransition(label = "cursor")
+    val cursorAlpha by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 500),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "cursorBlink"
+    )
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF121212))
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+            .background(Color(0xFF000000))
     ) {
-        // Status & Session Header Card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
-            shape = RoundedCornerShape(8.dp)
+        // Sleek Minimal Header (Termux / Pro Console Style)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF0D0D0D))
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column {
-                    Text(
-                        text = "Interactive PTY Terminal",
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
-                        fontSize = 16.sp
-                    )
-                    Text(
-                        text = state.statusMessage,
-                        color = if (state.isTerminalActive) Color(0xFF69F0AE) else Color.LightGray,
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .background(
+                            if (state.isTerminalActive) Color(0xFF00FF66) else Color(0xFFFF5252),
+                            shape = CircleShape
+                        )
+                )
+                Text(
+                    text = if (state.isTerminalActive) "VPortable Terminal (Alpine Linux v3.24)" else "Terminal Offline",
+                    color = Color.LightGray,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Medium
+                )
+            }
 
-                if (state.isExtractingRootfs) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.height(20.dp).width(20.dp),
-                        color = Color(0xFF69F0AE),
-                        strokeWidth = 2.dp
-                    )
-                } else if (!state.isTerminalActive) {
-                    Button(
-                        onClick = { viewModel.startTerminal(context) },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2196F3)),
-                        shape = RoundedCornerShape(6.dp)
-                    ) {
-                        Text("Start Terminal", color = Color.White, fontSize = 12.sp)
-                    }
-                } else {
-                    Button(
-                        onClick = { viewModel.closeTerminal() },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
-                        shape = RoundedCornerShape(6.dp)
-                    ) {
-                        Text("Exit", color = Color.White, fontSize = 12.sp)
-                    }
+            if (state.isExtractingRootfs) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    color = Color(0xFF00FF66),
+                    strokeWidth = 2.dp
+                )
+            } else if (!state.isTerminalActive) {
+                Button(
+                    onClick = { viewModel.startTerminal(context) },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
+                    shape = RoundedCornerShape(4.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.height(28.dp)
+                ) {
+                    Text("Boot Alpine", color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                }
+            } else {
+                Button(
+                    onClick = { viewModel.closeTerminal() },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                    shape = RoundedCornerShape(4.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.height(28.dp)
+                ) {
+                    Text("Exit", color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                 }
             }
         }
 
-        // Terminal Canvas Display Area (Termux-Style)
+        // Full-Screen Terminal Canvas Area
         val scrollState = rememberScrollState()
         LaunchedEffect(state.terminalOutput) {
             if (state.terminalOutput.isNotEmpty()) {
@@ -129,7 +150,7 @@ fun TerminalScreen(
             }
         }
 
-        // Invisible input field that intercepts character keystrokes directly
+        // Hidden input bridge capturing raw keystrokes without blocking IME
         BasicTextField(
             value = textFieldValue,
             onValueChange = { newValue ->
@@ -137,34 +158,37 @@ fun TerminalScreen(
                 val newText = newValue.text
 
                 if (newText.length > oldText.length) {
-                    val addedText = newText.substring(oldText.length)
-                    viewModel.sendRawInput(addedText)
+                    val added = newText.substring(oldText.length)
+                    viewModel.sendRawInput(added)
                 } else if (newText.length < oldText.length) {
-                    val diffCount = oldText.length - newText.length
-                    repeat(diffCount) {
+                    val diff = oldText.length - newText.length
+                    repeat(diff) {
                         viewModel.sendBackspace()
                     }
                 }
-                textFieldValue = TextFieldValue(text = "", selection = TextRange(0))
-            },
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-            keyboardActions = KeyboardActions(onSend = {
-                viewModel.sendEnter()
                 textFieldValue = TextFieldValue("", selection = TextRange(0))
+            },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Ascii,
+                imeAction = ImeAction.None,
+                autoCorrect = false
+            ),
+            keyboardActions = KeyboardActions(onAny = {
+                viewModel.sendEnter()
             }),
+            cursorBrush = SolidColor(Color.Transparent),
             modifier = Modifier
-                .height(0.dp)
-                .width(0.dp)
+                .size(1.dp)
+                .alpha(0.01f)
                 .focusRequester(focusRequester)
-                .focusable()
         )
 
+        // Main Terminal Text Canvas
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .background(Color(0xFF0A0A0A), shape = RoundedCornerShape(6.dp))
-                .border(1.dp, Color(0xFF333333), shape = RoundedCornerShape(6.dp))
+                .background(Color(0xFF000000))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null
@@ -174,86 +198,115 @@ fun TerminalScreen(
                         keyboardController?.show()
                     }
                 }
-                .padding(8.dp)
+                .padding(horizontal = 10.dp, vertical = 6.dp)
         ) {
             if (state.terminalOutput.isEmpty() && !state.isTerminalActive) {
                 Text(
-                    text = "Tap 'Start Terminal' to launch interactive Alpine Linux shell (/bin/sh -i)...",
-                    color = Color.Gray,
+                    text = "VPortable Container Runtime\nTap 'Boot Alpine' above to launch interactive rootfs shell...",
+                    color = Color.DarkGray,
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp
                 )
             } else {
                 SelectionContainer {
-                    Text(
-                        text = state.terminalOutput,
-                        color = Color(0xFF69F0AE),
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.sp,
-                        lineHeight = 16.sp,
+                    Row(
                         modifier = Modifier
                             .fillMaxSize()
                             .verticalScroll(scrollState)
-                    )
+                    ) {
+                        Text(
+                            text = state.terminalOutput,
+                            color = Color(0xFF00FF66), // Termux Matrix Green
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                            lineHeight = 16.sp
+                        )
+                        if (state.isTerminalActive) {
+                            Text(
+                                text = "█",
+                                color = Color(0xFF00FF66).copy(alpha = cursorAlpha),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 12.sp,
+                                lineHeight = 16.sp
+                            )
+                        }
+                    }
                 }
             }
         }
 
-        // Quick Action Toolbar Row
+        // Termux-Style Extra Keys Toolbar (Sits directly above keyboard)
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF141414))
+                .padding(horizontal = 4.dp, vertical = 3.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            Button(
-                onClick = {
-                    viewModel.sendCtrlC()
-                    focusRequester.requestFocus()
-                    keyboardController?.show()
-                },
-                enabled = state.isTerminalActive,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF424242)),
-                shape = RoundedCornerShape(4.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Ctrl+C", fontSize = 11.sp, color = Color.White)
-            }
+            val keyModifier = Modifier
+                .weight(1f)
+                .height(34.dp)
 
-            Button(
-                onClick = {
-                    viewModel.sendTab()
-                    focusRequester.requestFocus()
-                    keyboardController?.show()
-                },
-                enabled = state.isTerminalActive,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF424242)),
-                shape = RoundedCornerShape(4.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Tab", fontSize = 11.sp, color = Color.White)
+            TermuxKeyButton("ESC", keyModifier) {
+                viewModel.sendEsc()
+                focusRequester.requestFocus()
+                keyboardController?.show()
             }
-
-            Button(
-                onClick = {
-                    viewModel.sendEsc()
-                    focusRequester.requestFocus()
-                    keyboardController?.show()
-                },
-                enabled = state.isTerminalActive,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF424242)),
-                shape = RoundedCornerShape(4.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("ESC", fontSize = 11.sp, color = Color.White)
+            TermuxKeyButton("TAB", keyModifier) {
+                viewModel.sendTab()
+                focusRequester.requestFocus()
+                keyboardController?.show()
             }
-
-            Button(
-                onClick = { viewModel.clearScreen() },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF424242)),
-                shape = RoundedCornerShape(4.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Clear", fontSize = 11.sp, color = Color.White)
+            TermuxKeyButton("CTRL", keyModifier) {
+                viewModel.sendCtrlC()
+                focusRequester.requestFocus()
+                keyboardController?.show()
+            }
+            TermuxKeyButton("/", keyModifier) {
+                viewModel.sendRawInput("/")
+                focusRequester.requestFocus()
+                keyboardController?.show()
+            }
+            TermuxKeyButton("-", keyModifier) {
+                viewModel.sendRawInput("-")
+                focusRequester.requestFocus()
+                keyboardController?.show()
+            }
+            TermuxKeyButton("↑", keyModifier) {
+                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x41)) // Up Arrow ANSI
+            }
+            TermuxKeyButton("↓", keyModifier) {
+                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x42)) // Down Arrow ANSI
+            }
+            TermuxKeyButton("CLS", keyModifier) {
+                viewModel.clearScreen()
             }
         }
+    }
+}
+
+@Composable
+private fun TermuxKeyButton(
+    label: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Button(
+        onClick = onClick,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = Color(0xFF222222),
+            contentColor = Color(0xFFE0E0E0)
+        ),
+        shape = RoundedCornerShape(2.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+        modifier = modifier
+    ) {
+        Text(
+            text = label,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace
+        )
     }
 }
