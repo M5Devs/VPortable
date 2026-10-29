@@ -111,7 +111,7 @@ class TerminalViewModel @JvmOverloads constructor(
     }
 
     fun sendEnter() {
-        sendBytes(byteArrayOf(0x0D)) // '\r'
+        sendBytes(byteArrayOf(0x0D, 0x0A)) // Carriage Return + Line Feed
     }
 
     fun sendBackspace() {
