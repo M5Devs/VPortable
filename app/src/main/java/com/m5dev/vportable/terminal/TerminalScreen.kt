@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -83,7 +82,7 @@ fun TerminalScreen(
             .fillMaxSize()
             .background(Color(0xFF000000))
     ) {
-        // Sleek Minimal Header (Termux / Pro Console Style)
+        // Minimal Sleek Header
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -142,7 +141,7 @@ fun TerminalScreen(
             }
         }
 
-        // Full-Screen Terminal Canvas Area
+        // Auto-scrolling terminal canvas
         val scrollState = rememberScrollState()
         LaunchedEffect(state.terminalOutput) {
             if (state.terminalOutput.isNotEmpty()) {
@@ -150,7 +149,7 @@ fun TerminalScreen(
             }
         }
 
-        // Hidden input bridge capturing raw keystrokes without blocking IME
+        // Hidden input field translating keystrokes and Enter to PTY
         BasicTextField(
             value = textFieldValue,
             onValueChange = { newValue ->
@@ -159,7 +158,12 @@ fun TerminalScreen(
 
                 if (newText.length > oldText.length) {
                     val added = newText.substring(oldText.length)
-                    viewModel.sendRawInput(added)
+                    // Intercept Enter key from Gboard / soft keyboard and send carriage return '\r'
+                    if (added == "\n" || added == "\r" || added == "\r\n") {
+                        viewModel.sendEnter()
+                    } else {
+                        viewModel.sendRawInput(added)
+                    }
                 } else if (newText.length < oldText.length) {
                     val diff = oldText.length - newText.length
                     repeat(diff) {
@@ -170,7 +174,7 @@ fun TerminalScreen(
             },
             keyboardOptions = KeyboardOptions(
                 keyboardType = KeyboardType.Ascii,
-                imeAction = ImeAction.None,
+                imeAction = ImeAction.Go,
                 autoCorrect = false
             ),
             keyboardActions = KeyboardActions(onAny = {
@@ -183,7 +187,7 @@ fun TerminalScreen(
                 .focusRequester(focusRequester)
         )
 
-        // Main Terminal Text Canvas
+        // Main Terminal Canvas Display
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -236,7 +240,7 @@ fun TerminalScreen(
             }
         }
 
-        // Termux-Style Extra Keys Toolbar (Sits directly above keyboard)
+        // Termux-Style Extra Keys Toolbar (ESC, TAB, CTRL, etc.)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -274,10 +278,10 @@ fun TerminalScreen(
                 keyboardController?.show()
             }
             TermuxKeyButton("↑", keyModifier) {
-                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x41)) // Up Arrow ANSI
+                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x41)) // Up Arrow
             }
             TermuxKeyButton("↓", keyModifier) {
-                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x42)) // Down Arrow ANSI
+                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x42)) // Down Arrow
             }
             TermuxKeyButton("CLS", keyModifier) {
                 viewModel.clearScreen()
