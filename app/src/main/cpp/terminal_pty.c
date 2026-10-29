@@ -43,7 +43,7 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
     }
 
     if (pid == 0) {
-        // Child Process: setup environment & execute VFS supervisor /bin/sh -i
+        // Child Process: Setup environment & execute VFS supervisor /bin/sh -i
         if (c_rootfs && strlen(c_rootfs) > 0) {
             chdir(c_rootfs);
         }
@@ -52,6 +52,8 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
         setenv("HOME", "/root", 1);
         setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/system/bin", 1);
         setenv("PROOT_NO_SECCOMP", "1", 1);
+        // Prompt String (Termux / Linux Style)
+        setenv("PS1", "vportable:\\w # ", 1);
 
         char supervisor_path[1024];
         snprintf(supervisor_path, sizeof(supervisor_path), "%s/libprobe_ptrace.so", c_native_dir ? c_native_dir : "");
@@ -70,6 +72,7 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
             execv(supervisor_path, supervisor_args);
         }
 
+        // Fallback to standalone BusyBox interactive shell
         char busybox_path[1024];
         snprintf(busybox_path, sizeof(busybox_path), "%s/libbusybox.so", c_native_dir ? c_native_dir : "");
         char *sh_args[] = { "sh", "-i", NULL };
@@ -123,7 +126,7 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeRead(
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return 0; // No data available right now (non-blocking)
         }
-        return -1; // Genuine error
+        return -1; // Genuine error / EIO (closed)
     }
 
     if (bytes_read == 0) {
