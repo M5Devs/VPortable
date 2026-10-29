@@ -223,18 +223,15 @@ typedef struct {
 static mount_entry_t mount_table[MOUNT_TABLE_SIZE];
 
 static void init_mount_table(const char *rootfs_dir) {
-    // 0. Binary paths
     mount_table[0].guest_prefix = "/bin";
     snprintf(mount_table[0].host_target, sizeof(mount_table[0].host_target), "%s/bin", rootfs_dir);
 
     mount_table[1].guest_prefix = "/sbin";
     snprintf(mount_table[1].host_target, sizeof(mount_table[1].host_target), "%s/sbin", rootfs_dir);
 
-    // 1. User hierarchy (Crucial for Alpine tools)
     mount_table[2].guest_prefix = "/usr";
     snprintf(mount_table[2].host_target, sizeof(mount_table[2].host_target), "%s/usr", rootfs_dir);
 
-    // 2. Configuration & Libraries
     mount_table[3].guest_prefix = "/etc";
     snprintf(mount_table[3].host_target, sizeof(mount_table[3].host_target), "%s/etc", rootfs_dir);
 
@@ -244,7 +241,6 @@ static void init_mount_table(const char *rootfs_dir) {
     mount_table[5].guest_prefix = "/lib";
     snprintf(mount_table[5].host_target, sizeof(mount_table[5].host_target), "%s/lib", rootfs_dir);
 
-    // 3. State & Temp
     mount_table[6].guest_prefix = "/var";
     snprintf(mount_table[6].host_target, sizeof(mount_table[6].host_target), "%s/var", rootfs_dir);
 
@@ -270,7 +266,6 @@ static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size
     return 0;
 }
 
-// Helper: resolve relative path against process CWD
 static void resolve_relative_or_absolute(const char *in_path, const char *cwd, char *out_path, size_t out_size) {
     if (in_path[0] == '/') {
         strncpy(out_path, in_path, out_size - 1);
@@ -284,7 +279,6 @@ static void resolve_relative_or_absolute(const char *in_path, const char *cwd, c
     }
 }
 
-// Helper: resolve dirfd and relative path
 static void resolve_dirfd_and_path(pid_t pid, long dirfd, const char *raw_path, const char *cwd, char *out_path, size_t out_size) {
     if (raw_path[0] == '/' || dirfd == AT_FDCWD) {
         char full_virtual[1024] = {0};
@@ -306,9 +300,7 @@ static void resolve_dirfd_and_path(pid_t pid, long dirfd, const char *raw_path, 
             } else {
                 snprintf(combined, sizeof(combined), "%s/%s", dir_target, raw_path);
             }
-            if (resolve_vfs_path(combined, out_path, out_size)) {
-                // Resolved virtual path to host target
-            } else {
+            if (!resolve_vfs_path(combined, out_path, out_size)) {
                 strncpy(out_path, combined, out_size - 1);
                 out_path[out_size - 1] = '\0';
             }
@@ -323,7 +315,6 @@ static void resolve_dirfd_and_path(pid_t pid, long dirfd, const char *raw_path, 
     }
 }
 
-// ---------------- Memory & Reg Helpers ----------------
 static int get_child_regs(pid_t child, arch_regs_t *regs) {
     struct iovec iov = { .iov_base = regs, .iov_len = sizeof(*regs) };
     return ptrace(PTRACE_GETREGSET, child, (void*)(uintptr_t)NT_PRSTATUS, &iov);
@@ -361,7 +352,6 @@ static void ensure_argv0(pid_t child, uintptr_t argv_ptr, uintptr_t sh_addr, con
     }
 }
 
-// ---------------- Main Supervisor Logic ----------------
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr, "USAGE: %s <rootfs_dir> <native_lib_dir> <command> [args...]\n", argv[0]);
@@ -379,8 +369,11 @@ int main(int argc, char *argv[]) {
     if (child < 0) return 1;
 
     if (child == 0) {
-        // Child Process
-        setpgid(0, 0);
+        // Child Process: Ensure child owns controlling terminal foreground if running under PTY
+        if (isatty(STDIN_FILENO)) {
+            setpgid(0, 0);
+            tcsetpgrp(STDIN_FILENO, getpid());
+        }
 
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
             perror("ptrace PTRACE_TRACEME failed");
@@ -573,25 +566,14 @@ int main(int argc, char *argv[]) {
             } else if (sig == SIGSTOP) {
                 ptrace(PTRACE_SETOPTIONS, cur_pid, NULL, (void*)options);
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
+            } else if (sig == SIGTTIN || sig == SIGTTOU) {
+                // Do NOT suspend or kill interactive shell on TTY control signals
+                ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else {
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, (void*)(uintptr_t)sig);
             }
         }
     }
-
-    // Print Alpine Boot Marker and dump /etc/os-release metadata
-    printf("VPORTABLE_ALPINE_BOOT_OK\n");
-    char os_release_path[2048] = {0};
-    snprintf(os_release_path, sizeof(os_release_path), "%s/etc/os-release", rootfs_dir);
-    FILE *f = fopen(os_release_path, "r");
-    if (f) {
-        char line_buf[512];
-        while (fgets(line_buf, sizeof(line_buf), f)) {
-            printf("%s", line_buf);
-        }
-        fclose(f);
-    }
-    fflush(stdout);
 
     cleanup_process_group();
     return 0;

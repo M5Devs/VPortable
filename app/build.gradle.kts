@@ -21,7 +21,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                targets("libprobe_ptrace.so", "vfs_shared", "vfs_dynamic_bin")
+                targets("libprobe_ptrace.so", "vfs_shared", "vfs_dynamic_bin", "vportable_pty")
             }
         }
     }

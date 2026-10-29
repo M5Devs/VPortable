@@ -13,3 +13,6 @@ set_target_properties(vfs_dynamic_bin PROPERTIES
     OUTPUT_NAME "libvfs_dynamic_bin.so"
     LINK_FLAGS "-Wl,-rpath,\\$ORIGIN/../lib -Wl,-rpath,\\$ORIGIN/../lib64 -Wl,-rpath,/lib -Wl,-rpath,/lib64"
 )
+
+add_library(vportable_pty SHARED terminal_pty.c)
+target_link_libraries(vportable_pty log)
