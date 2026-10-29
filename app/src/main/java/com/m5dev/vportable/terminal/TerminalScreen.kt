@@ -149,7 +149,7 @@ fun TerminalScreen(
             }
         }
 
-        // Hidden input field translating keystrokes and Enter to PTY
+        // Hidden input field capturing keystrokes and Go/Enter
         BasicTextField(
             value = textFieldValue,
             onValueChange = { newValue ->
@@ -158,8 +158,7 @@ fun TerminalScreen(
 
                 if (newText.length > oldText.length) {
                     val added = newText.substring(oldText.length)
-                    // Intercept Enter key from Gboard / soft keyboard and send carriage return '\r'
-                    if (added == "\n" || added == "\r" || added == "\r\n") {
+                    if (added.contains("\n") || added.contains("\r")) {
                         viewModel.sendEnter()
                     } else {
                         viewModel.sendRawInput(added)
@@ -177,9 +176,11 @@ fun TerminalScreen(
                 imeAction = ImeAction.Go,
                 autoCorrect = false
             ),
-            keyboardActions = KeyboardActions(onAny = {
-                viewModel.sendEnter()
-            }),
+            keyboardActions = KeyboardActions(
+                onGo = { viewModel.sendEnter() },
+                onDone = { viewModel.sendEnter() },
+                onSend = { viewModel.sendEnter() }
+            ),
             cursorBrush = SolidColor(Color.Transparent),
             modifier = Modifier
                 .size(1.dp)
@@ -240,7 +241,7 @@ fun TerminalScreen(
             }
         }
 
-        // Termux-Style Extra Keys Toolbar (ESC, TAB, CTRL, etc.)
+        // Termux-Style Extra Keys Toolbar (With ENTER Key ↵)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -278,13 +279,16 @@ fun TerminalScreen(
                 keyboardController?.show()
             }
             TermuxKeyButton("↑", keyModifier) {
-                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x41)) // Up Arrow
-            }
-            TermuxKeyButton("↓", keyModifier) {
-                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x42)) // Down Arrow
+                viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x41))
             }
             TermuxKeyButton("CLS", keyModifier) {
                 viewModel.clearScreen()
+            }
+            // زرار الـ ENTER المباشر باللون الأخضر الشياكة!
+            TermuxKeyButton("↵", keyModifier, isEnter = true) {
+                viewModel.sendEnter()
+                focusRequester.requestFocus()
+                keyboardController?.show()
             }
         }
     }
@@ -294,13 +298,14 @@ fun TerminalScreen(
 private fun TermuxKeyButton(
     label: String,
     modifier: Modifier = Modifier,
+    isEnter: Boolean = false,
     onClick: () -> Unit
 ) {
     Button(
         onClick = onClick,
         colors = ButtonDefaults.buttonColors(
-            containerColor = Color(0xFF222222),
-            contentColor = Color(0xFFE0E0E0)
+            containerColor = if (isEnter) Color(0xFF1B5E20) else Color(0xFF222222),
+            contentColor = if (isEnter) Color(0xFF00FF66) else Color(0xFFE0E0E0)
         ),
         shape = RoundedCornerShape(2.dp),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
@@ -308,7 +313,7 @@ private fun TermuxKeyButton(
     ) {
         Text(
             text = label,
-            fontSize = 10.sp,
+            fontSize = if (isEnter) 14.sp else 10.sp,
             fontWeight = FontWeight.Bold,
             fontFamily = FontFamily.Monospace
         )
