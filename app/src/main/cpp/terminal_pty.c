@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <jni.h>
 #include <pty.h>
 #include <unistd.h>
@@ -52,7 +53,6 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
         setenv("HOME", "/root", 1);
         setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/system/bin", 1);
         setenv("PROOT_NO_SECCOMP", "1", 1);
-        // Prompt String (Termux / Linux Style)
         setenv("PS1", "vportable:\\w # ", 1);
 
         char supervisor_path[1024];
@@ -93,6 +93,18 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
     // Parent Process
     (*env)->ReleaseStringUTFChars(env, rootfsPath, c_rootfs);
     (*env)->ReleaseStringUTFChars(env, nativeDir, c_native_dir);
+
+    // Configure standard POSIX TTY Line Discipline (Termux Engine Protocol)
+    struct termios tios;
+    if (tcgetattr(master_fd, &tios) == 0) {
+        tios.c_iflag |= (ICRNL | IXON);                         // Map CR ('\r') to NL ('\n') automatically
+        tios.c_oflag |= (OPOST | ONLCR);                        // Map NL ('\n') to CR-NL ('\r\n') on output
+        tios.c_lflag |= (ISIG | ICANON | ECHO | ECHOE | ECHOK); // Enable Canonical Line Input & Echo
+        tios.c_cc[VEOF] = 4;                                    // Ctrl+D (EOF)
+        tios.c_cc[VINTR] = 3;                                   // Ctrl+C (Interrupt)
+        tios.c_cc[VERASE] = 127;                                // Backspace
+        tcsetattr(master_fd, TCSANOW, &tios);
+    }
 
     // Set master_fd to non-blocking
     int flags = fcntl(master_fd, F_GETFL, 0);
