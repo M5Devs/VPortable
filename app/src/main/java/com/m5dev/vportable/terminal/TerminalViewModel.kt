@@ -2,6 +2,7 @@ package com.m5dev.vportable.terminal
 
 import android.app.Application
 import android.content.Context
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.m5dev.vportable.flasher.VFlashEngine
@@ -15,6 +16,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.Executors
+
+private const val TAG = "TerminalInput"
 
 data class TerminalUiState(
     val isTerminalActive: Boolean = false,
@@ -96,9 +99,26 @@ class TerminalViewModel @JvmOverloads constructor(
             )
 
             readJob = launch {
-                bridge.readStream(masterFd).collect { text ->
+                try {
+                    bridge.readStream(masterFd).collect { text ->
+                        val clean = processAnsi(text)
+                        if (clean.isEmpty()) return@collect
+                        Log.d(TAG, "nativeRead -> ${clean.length} chars")
+                        _uiState.value = _uiState.value.copy(
+                            terminalOutput = _uiState.value.terminalOutput + clean
+                        )
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "PTY read loop ended: ${t.message}")
+                }
+                // readStream() only returns when nativeRead() reports EOF or a hard
+                // error (master fd closed / child gone). Surface that instead of
+                // leaving the screen looking alive but frozen.
+                if (masterFd >= 0 && _uiState.value.isTerminalActive) {
+                    Log.w(TAG, "PTY read loop finished unexpectedly; marking session closed")
                     _uiState.value = _uiState.value.copy(
-                        terminalOutput = _uiState.value.terminalOutput + processAnsi(text)
+                        isTerminalActive = false,
+                        statusMessage = "PTY Session Closed (shell exited)"
                     )
                 }
             }
@@ -112,6 +132,7 @@ class TerminalViewModel @JvmOverloads constructor(
 
     fun sendRawInput(text: String) {
         if (masterFd < 0 || !_uiState.value.isTerminalActive) return
+        Log.d(TAG, "sendRawInput ${formatBytes(text.toByteArray())}")
         sendBytes(text.toByteArray())
     }
 
@@ -136,14 +157,22 @@ class TerminalViewModel @JvmOverloads constructor(
     }
 
     fun sendBytes(bytes: ByteArray) {
-        if (masterFd < 0 || !_uiState.value.isTerminalActive) return
+        if (masterFd < 0 || !_uiState.value.isTerminalActive) {
+            Log.d(TAG, "sendBytes dropped (inactive): ${formatBytes(bytes)}")
+            return
+        }
         val fd = masterFd
+        Log.d(TAG, "sendBytes ${formatBytes(bytes)}")
         // All writes go through one single-threaded dispatcher so keystrokes
         // reach the PTY in the exact order they were produced.
         viewModelScope.launch(writeDispatcher) {
-            bridge.nativeWrite(fd, bytes, bytes.size)
+            val written = bridge.nativeWrite(fd, bytes, bytes.size)
+            Log.d(TAG, "nativeWrite($fd) -> $written / ${bytes.size}")
         }
     }
+
+    private fun formatBytes(bytes: ByteArray): String =
+        bytes.joinToString(" ") { String.format("%02X", it) }
 
     fun clearScreen() {
         _uiState.value = _uiState.value.copy(terminalOutput = "")

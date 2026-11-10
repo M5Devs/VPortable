@@ -1,5 +1,7 @@
 package com.m5dev.vportable.terminal
 
+import android.content.Context
+import android.view.inputmethod.InputMethodManager
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -20,9 +22,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -30,33 +29,27 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 
 @Composable
 fun TerminalScreen(
@@ -64,23 +57,38 @@ fun TerminalScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
-    val keyboardController = LocalSoftwareKeyboardController.current
-    val focusRequester = remember { FocusRequester() }
+    val inputView = remember { TerminalInputView(context) }
+    val inputMethodManager = remember {
+        context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+    }
+    val inputFocusRequester = remember { FocusRequester() }
 
-    var textFieldValue by remember { mutableStateOf(TextFieldValue("")) }
+    // The raw input view needs no text buffer; every commit goes straight to the PTY.
+    DisposableEffect(inputView) {
+        inputView.listener = TerminalInputView.Listener { bytes -> viewModel.sendBytes(bytes) }
+        onDispose { inputView.listener = null }
+    }
 
+    // Focus the view and raise the IME. Focus goes through a Compose
+    // FocusRequester on the AndroidView, which is what forwards focus into the
+    // hosted View; showSoftInput is requested on the view after it is focused,
+    // hence the post().
     fun focusInput() {
         try {
-            focusRequester.requestFocus()
+            inputFocusRequester.requestFocus()
         } catch (_: IllegalStateException) {
-            // Focus target not attached yet; the LaunchedEffect below retries.
+            // Not attached yet; the LaunchedEffect below retries.
         }
-        keyboardController?.show()
+        inputView.requestFocus()
+        inputView.post {
+            inputMethodManager?.showSoftInput(inputView, InputMethodManager.SHOW_IMPLICIT)
+        }
     }
 
     // Grab focus and raise the soft keyboard as soon as the PTY becomes active so
-    // the user can type immediately after booting.
-    LaunchedEffect(state.isTerminalActive) {
+    // the user can type immediately after booting. Keyed on the view so focus is
+    // restored when the screen re-enters composition after a tab switch.
+    LaunchedEffect(state.isTerminalActive, inputView) {
         if (state.isTerminalActive) {
             focusInput()
         }
@@ -170,43 +178,14 @@ fun TerminalScreen(
             }
         }
 
-        // Hidden input field capturing keystrokes and Go/Enter
-        BasicTextField(
-            value = textFieldValue,
-            onValueChange = { newValue ->
-                val oldText = textFieldValue.text
-                val newText = newValue.text
-
-                if (newText.length > oldText.length) {
-                    val added = newText.substring(oldText.length)
-                    if (added.contains("\n") || added.contains("\r")) {
-                        viewModel.sendEnter()
-                    } else {
-                        viewModel.sendRawInput(added)
-                    }
-                } else if (newText.length < oldText.length) {
-                    val diff = oldText.length - newText.length
-                    repeat(diff) {
-                        viewModel.sendBackspace()
-                    }
-                }
-                textFieldValue = TextFieldValue("", selection = TextRange(0))
-            },
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Ascii,
-                imeAction = ImeAction.Go,
-                autoCorrect = false
-            ),
-            keyboardActions = KeyboardActions(
-                onGo = { viewModel.sendEnter() },
-                onDone = { viewModel.sendEnter() },
-                onSend = { viewModel.sendEnter() }
-            ),
-            cursorBrush = SolidColor(Color.Transparent),
+        // Raw input surface. It renders nothing and keeps no text buffer, so the
+        // IME's composition state is never invalidated by us.
+        AndroidView(
+            factory = { inputView },
             modifier = Modifier
                 .size(1.dp)
                 .alpha(0.01f)
-                .focusRequester(focusRequester)
+                .focusRequester(inputFocusRequester)
         )
 
         // Main Terminal Canvas Display
@@ -227,7 +206,9 @@ fun TerminalScreen(
         ) {
             if (state.terminalOutput.isEmpty() && !state.isTerminalActive) {
                 Text(
-                    text = "VPortable Container Runtime\nTap 'Boot Alpine' above to launch interactive rootfs shell...",
+                    text = "VPortable Container Runtime\n" +
+                            "Tap 'Boot Alpine' above to launch interactive rootfs shell...\n\n" +
+                            "Status: ${state.statusMessage}",
                     color = Color.DarkGray,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.sp,

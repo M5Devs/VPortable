@@ -193,6 +193,7 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeRead(
     (*env)->SetByteArrayRegion(env, buffer, 0, (jsize) bytes_read, (jbyte *) c_buf);
     free(c_buf);
 
+    LOGI("nativeRead(fd=%d) -> %zd bytes", masterFd, bytes_read);
     return (jint) bytes_read;
 }
 
@@ -216,6 +217,7 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeWrite(
 
     (*env)->ReleaseByteArrayElements(env, data, c_data, JNI_ABORT);
 
+    LOGI("nativeWrite(fd=%d, %d bytes) -> %zd", masterFd, (int) len, bytes_written);
     return (jint) bytes_written;
 }
 
