@@ -45,12 +45,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -64,6 +68,23 @@ fun TerminalScreen(
     val focusRequester = remember { FocusRequester() }
 
     var textFieldValue by remember { mutableStateOf(TextFieldValue("")) }
+
+    fun focusInput() {
+        try {
+            focusRequester.requestFocus()
+        } catch (_: IllegalStateException) {
+            // Focus target not attached yet; the LaunchedEffect below retries.
+        }
+        keyboardController?.show()
+    }
+
+    // Grab focus and raise the soft keyboard as soon as the PTY becomes active so
+    // the user can type immediately after booting.
+    LaunchedEffect(state.isTerminalActive) {
+        if (state.isTerminalActive) {
+            focusInput()
+        }
+    }
 
     // Blinking cursor animation (Termux style █)
     val infiniteTransition = rememberInfiniteTransition(label = "cursor")
@@ -199,8 +220,7 @@ fun TerminalScreen(
                     indication = null
                 ) {
                     if (state.isTerminalActive) {
-                        focusRequester.requestFocus()
-                        keyboardController?.show()
+                        focusInput()
                     }
                 }
                 .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -215,28 +235,28 @@ fun TerminalScreen(
                 )
             } else {
                 SelectionContainer {
-                    Row(
+                    Text(
+                        // The cursor is concatenated into the output text. A sibling
+                        // Text in a Row would be pushed off-screen by the full-width
+                        // multi-line output above it.
+                        text = if (state.isTerminalActive) {
+                            buildAnnotatedString {
+                                append(state.terminalOutput)
+                                withStyle(SpanStyle(color = Color(0xFF00FF66).copy(alpha = cursorAlpha))) {
+                                    append("█")
+                                }
+                            }
+                        } else {
+                            AnnotatedString(state.terminalOutput)
+                        },
+                        color = Color(0xFF00FF66), // Termux Matrix Green
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
                         modifier = Modifier
-                            .fillMaxSize()
+                            .fillMaxWidth()
                             .verticalScroll(scrollState)
-                    ) {
-                        Text(
-                            text = state.terminalOutput,
-                            color = Color(0xFF00FF66), // Termux Matrix Green
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 12.sp,
-                            lineHeight = 16.sp
-                        )
-                        if (state.isTerminalActive) {
-                            Text(
-                                text = "█",
-                                color = Color(0xFF00FF66).copy(alpha = cursorAlpha),
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 12.sp,
-                                lineHeight = 16.sp
-                            )
-                        }
-                    }
+                    )
                 }
             }
         }
@@ -255,28 +275,23 @@ fun TerminalScreen(
 
             TermuxKeyButton("ESC", keyModifier) {
                 viewModel.sendEsc()
-                focusRequester.requestFocus()
-                keyboardController?.show()
+                focusInput()
             }
             TermuxKeyButton("TAB", keyModifier) {
                 viewModel.sendTab()
-                focusRequester.requestFocus()
-                keyboardController?.show()
+                focusInput()
             }
             TermuxKeyButton("CTRL", keyModifier) {
                 viewModel.sendCtrlC()
-                focusRequester.requestFocus()
-                keyboardController?.show()
+                focusInput()
             }
             TermuxKeyButton("/", keyModifier) {
                 viewModel.sendRawInput("/")
-                focusRequester.requestFocus()
-                keyboardController?.show()
+                focusInput()
             }
             TermuxKeyButton("-", keyModifier) {
                 viewModel.sendRawInput("-")
-                focusRequester.requestFocus()
-                keyboardController?.show()
+                focusInput()
             }
             TermuxKeyButton("↑", keyModifier) {
                 viewModel.sendBytes(byteArrayOf(0x1B, 0x5B, 0x41))
@@ -287,8 +302,7 @@ fun TerminalScreen(
             // زرار الـ ENTER المباشر باللون الأخضر الشياكة!
             TermuxKeyButton("↵", keyModifier, isEnter = true) {
                 viewModel.sendEnter()
-                focusRequester.requestFocus()
-                keyboardController?.show()
+                focusInput()
             }
         }
     }

@@ -172,7 +172,10 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeRead(
     char *c_buf = (char *) malloc(buf_len);
     if (!c_buf) return -1;
 
-    ssize_t bytes_read = read(masterFd, c_buf, buf_len);
+    ssize_t bytes_read;
+    do {
+        bytes_read = read(masterFd, c_buf, buf_len);
+    } while (bytes_read < 0 && errno == EINTR);
 
     if (bytes_read < 0) {
         free(c_buf);

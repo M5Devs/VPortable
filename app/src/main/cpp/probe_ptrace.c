@@ -217,6 +217,46 @@ static void restore_terminal_foreground(void) {
     }
 }
 
+// Move the controlling terminal to `pgid` and confirm the kernel accepted it.
+// SIGTTOU must already be ignored, otherwise this call suspends us when we are
+// not the current foreground group. Returns 1 on success.
+static int acquire_terminal_foreground(pid_t pgid) {
+    if (tcsetpgrp(STDIN_FILENO, pgid) != 0) {
+        return 0;
+    }
+    return tcgetpgrp(STDIN_FILENO) == pgid;
+}
+
+// Guarantee the traced shell can read the terminal.
+//
+// The child joins its own process group so the supervisor can keep job control
+// isolated, but a shell left in a background group has its first read()
+// SIGTTIN-suspended and the whole session appears frozen. If the terminal
+// handover fails for any reason, put the child back into the supervisor's
+// (foreground) group instead of silently freezing.
+static void establish_terminal_foreground(pid_t child) {
+    if (!isatty(STDIN_FILENO)) {
+        return;
+    }
+    signal(SIGTTOU, SIG_IGN);
+    if (acquire_terminal_foreground(child)) {
+        return;
+    }
+    if (setpgid(child, getpgrp()) == 0) {
+        fprintf(stderr,
+                "SUPERVISOR: WARNING could not give the terminal to pgid %d (%s); "
+                "sharing the supervisor's process group so input still reaches the shell\n",
+                child, strerror(errno));
+        fflush(stderr);
+    } else {
+        fprintf(stderr,
+                "SUPERVISOR: ERROR terminal handover to pgid %d failed (%s) and the "
+                "fallback also failed (%s); interactive input may not work\n",
+                child, strerror(errno), strerror(errno));
+        fflush(stderr);
+    }
+}
+
 static void signal_handler(int sig) {
     cleanup_process_group();
     restore_terminal_foreground();
@@ -419,10 +459,7 @@ int main(int argc, char *argv[]) {
     // The child is stopped in PTRACE_TRACEME. Only now is it safe for the
     // supervisor to move the controlling terminal to the child's process group:
     // doing it while the child still shares our group would fail.
-    if (isatty(STDIN_FILENO)) {
-        signal(SIGTTOU, SIG_IGN);
-        tcsetpgrp(STDIN_FILENO, child);
-    }
+    establish_terminal_foreground(child);
 
     unsigned long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | 
                             PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE | 
