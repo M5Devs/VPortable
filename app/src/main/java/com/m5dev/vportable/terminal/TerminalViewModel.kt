@@ -10,9 +10,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.Executors
 
 data class TerminalUiState(
     val isTerminalActive: Boolean = false,
@@ -31,6 +33,12 @@ class TerminalViewModel @JvmOverloads constructor(
 
     private var masterFd: Int = -1
     private var readJob: Job? = null
+
+    // Single-threaded dispatcher: serialises PTY writes so keystrokes are not
+    // reordered by the thread pool.
+    private val writeDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "vportable-pty-writer")
+    }.asCoroutineDispatcher()
 
     fun startTerminal(context: Context, cols: Int = 80, rows: Int = 24) {
         if (_uiState.value.isTerminalActive || _uiState.value.isExtractingRootfs) return
@@ -104,14 +112,11 @@ class TerminalViewModel @JvmOverloads constructor(
 
     fun sendRawInput(text: String) {
         if (masterFd < 0 || !_uiState.value.isTerminalActive) return
-        val payload = text.toByteArray()
-        viewModelScope.launch(Dispatchers.IO) {
-            bridge.nativeWrite(masterFd, payload, payload.size)
-        }
+        sendBytes(text.toByteArray())
     }
 
     fun sendEnter() {
-        sendBytes(byteArrayOf(0x0D, 0x0A)) // Carriage Return + Line Feed
+        sendBytes(byteArrayOf(0x0D)) // 0x0D ('\r') translated to '\n' by ICRNL
     }
 
     fun sendBackspace() {
@@ -132,8 +137,11 @@ class TerminalViewModel @JvmOverloads constructor(
 
     fun sendBytes(bytes: ByteArray) {
         if (masterFd < 0 || !_uiState.value.isTerminalActive) return
-        viewModelScope.launch(Dispatchers.IO) {
-            bridge.nativeWrite(masterFd, bytes, bytes.size)
+        val fd = masterFd
+        // All writes go through one single-threaded dispatcher so keystrokes
+        // reach the PTY in the exact order they were produced.
+        viewModelScope.launch(writeDispatcher) {
+            bridge.nativeWrite(fd, bytes, bytes.size)
         }
     }
 
@@ -160,5 +168,6 @@ class TerminalViewModel @JvmOverloads constructor(
     override fun onCleared() {
         super.onCleared()
         closeTerminal()
+        writeDispatcher.close()
     }
 }

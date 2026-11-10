@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <elf.h>
 #include <signal.h>
+#include <termios.h>
 
 #ifndef NT_PRSTATUS
 #define NT_PRSTATUS 1
@@ -208,8 +209,17 @@ static void cleanup_process_group(void) {
     }
 }
 
+// Hand the controlling terminal back to the supervisor's process group. Must be
+// called with SIGTTOU ignored, otherwise the call itself suspends us.
+static void restore_terminal_foreground(void) {
+    if (isatty(STDIN_FILENO)) {
+        tcsetpgrp(STDIN_FILENO, getpgrp());
+    }
+}
+
 static void signal_handler(int sig) {
     cleanup_process_group();
+    restore_terminal_foreground();
     _exit(128 + sig);
 }
 
@@ -369,10 +379,12 @@ int main(int argc, char *argv[]) {
     if (child < 0) return 1;
 
     if (child == 0) {
-        // Child Process: Ensure child owns controlling terminal foreground if running under PTY
+        // Child Process: Join a new process group. The controlling terminal is
+        // transferred to this group by the supervisor *after* the child stops;
+        // calling tcsetpgrp() here would raise SIGTTOU and strand the shell in
+        // the background, where its first read() gets SIGTTIN-suspended.
         if (isatty(STDIN_FILENO)) {
             setpgid(0, 0);
-            tcsetpgrp(STDIN_FILENO, getpid());
         }
 
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
@@ -402,6 +414,14 @@ int main(int argc, char *argv[]) {
     if (waitpid(child, &status, 0) < 0) {
         cleanup_process_group();
         return 1;
+    }
+
+    // The child is stopped in PTRACE_TRACEME. Only now is it safe for the
+    // supervisor to move the controlling terminal to the child's process group:
+    // doing it while the child still shares our group would fail.
+    if (isatty(STDIN_FILENO)) {
+        signal(SIGTTOU, SIG_IGN);
+        tcsetpgrp(STDIN_FILENO, child);
     }
 
     unsigned long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | 
@@ -576,5 +596,6 @@ int main(int argc, char *argv[]) {
     }
 
     cleanup_process_group();
+    restore_terminal_foreground();
     return 0;
 }

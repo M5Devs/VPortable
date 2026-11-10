@@ -10,11 +10,48 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <poll.h>
 #include <android/log.h>
 
 #define LOG_TAG "TerminalPTY"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// Write the whole buffer, transparently handling partial writes, EINTR and the
+// EAGAIN that the non-blocking master fd returns when the slave's input queue is
+// full. Returns the number of bytes written, or -1 on a genuine error.
+static ssize_t write_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *) buf;
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t) n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            int pr = poll(&pfd, 1, -1);
+            if (pr < 0 && errno == EINTR) {
+                continue;
+            }
+            if (pr < 0) {
+                return -1;
+            }
+            continue;
+        }
+        return -1;
+    }
+    return (ssize_t) len;
+}
 
 JNIEXPORT jint JNICALL
 Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
@@ -33,8 +70,24 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
     ws.ws_col = (unsigned short) (cols > 0 ? cols : 80);
     ws.ws_row = (unsigned short) (rows > 0 ? rows : 24);
 
+    // Build the line discipline before the PTY exists so the slave is created
+    // already configured: setting termios after forkpty() races with the child,
+    // which can start reading input under a half-configured tty.
+    struct termios tio;
+    memset(&tio, 0, sizeof(tio));
+    if (tcgetattr(STDIN_FILENO, &tio) < 0) {
+        memset(&tio, 0, sizeof(tio));
+    }
+    tio.c_iflag |= (ICRNL | IXON);
+    tio.c_oflag |= (OPOST | ONLCR);
+    tio.c_lflag |= (ISIG | ICANON | ECHO | ECHOE | ECHOK);
+    tio.c_cflag |= (CS8 | CREAD); // required when the tcgetattr fallback zeroed the struct
+    tio.c_cc[VEOF] = 4;
+    tio.c_cc[VINTR] = 3;
+    tio.c_cc[VERASE] = 127;
+
     int master_fd = -1;
-    pid_t pid = forkpty(&master_fd, NULL, NULL, &ws);
+    pid_t pid = forkpty(&master_fd, NULL, &tio, &ws);
 
     if (pid < 0) {
         LOGE("forkpty failed: %s", strerror(errno));
@@ -93,18 +146,6 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
     // Parent Process
     (*env)->ReleaseStringUTFChars(env, rootfsPath, c_rootfs);
     (*env)->ReleaseStringUTFChars(env, nativeDir, c_native_dir);
-
-    // Configure standard POSIX TTY Line Discipline (Termux Engine Protocol)
-    struct termios tios;
-    if (tcgetattr(master_fd, &tios) == 0) {
-        tios.c_iflag |= (ICRNL | IXON);                         // Map CR ('\r') to NL ('\n') automatically
-        tios.c_oflag |= (OPOST | ONLCR);                        // Map NL ('\n') to CR-NL ('\r\n') on output
-        tios.c_lflag |= (ISIG | ICANON | ECHO | ECHOE | ECHOK); // Enable Canonical Line Input & Echo
-        tios.c_cc[VEOF] = 4;                                    // Ctrl+D (EOF)
-        tios.c_cc[VINTR] = 3;                                   // Ctrl+C (Interrupt)
-        tios.c_cc[VERASE] = 127;                                // Backspace
-        tcsetattr(master_fd, TCSANOW, &tios);
-    }
 
     // Set master_fd to non-blocking
     int flags = fcntl(master_fd, F_GETFL, 0);
@@ -168,7 +209,7 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeWrite(
     jbyte *c_data = (*env)->GetByteArrayElements(env, data, NULL);
     if (!c_data) return -1;
 
-    ssize_t bytes_written = write(masterFd, c_data, len);
+    ssize_t bytes_written = write_all(masterFd, c_data, (size_t) len);
 
     (*env)->ReleaseByteArrayElements(env, data, c_data, JNI_ABORT);
 
