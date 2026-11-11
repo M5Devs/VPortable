@@ -4,6 +4,9 @@ project("vportable_native")
 
 add_executable(libprobe_ptrace.so probe_ptrace.c)
 set_target_properties(libprobe_ptrace.so PROPERTIES OUTPUT_NAME "libprobe_ptrace.so")
+# The supervisor reports diagnostics through logcat instead of the PTY it shares
+# with the guest shell, so it needs liblog.
+target_link_libraries(libprobe_ptrace.so log)
 
 add_library(vfs_shared SHARED vfs_shared.c)
 

@@ -30,6 +30,7 @@ import sys
 import time
 
 MARKER = "VPPORTABLE_PROMPT_OK_9f3c"
+SECOND = "VPPORTABLE_STILL_ALIVE_5b1e"
 SUP = sys.argv[1] if len(sys.argv) > 1 else "/tmp/probe_ptrace"
 TIMEOUT = float(sys.argv[2]) if len(sys.argv) > 2 else 6.0
 
@@ -55,8 +56,11 @@ def run():
     buf = bytearray()
     deadline = time.time() + TIMEOUT
     sent = False
+    sent_second = False
     saw_prompt = False
     saw_marker = False
+    saw_second = False
+    exited_early = False
     while time.time() < deadline:
         r, _, _ = select.select([master], [], [], 0.2)
         if master in r:
@@ -78,13 +82,24 @@ def run():
                     os.write(master, ("echo " + MARKER + "\n").encode())
                     sent = True
                     deadline = time.time() + 3.0
+                elif not sent_second:
+                    # The shell must still be alive after the first command; a
+                    # dead shell is exactly the "Terminal Offline" symptom.
+                    time.sleep(0.3)
+                    os.write(master, ("echo " + SECOND + "\n").encode())
+                    sent_second = True
+                    deadline = time.time() + 3.0
             if MARKER.encode() in chunk:
                 saw_marker = True
+            if SECOND.encode() in chunk:
+                saw_second = True
         try:
             w, _ = os.waitpid(pid, os.WNOHANG)
             if w == pid:
+                exited_early = True
                 break
         except ChildProcessError:
+            exited_early = True
             break
 
     try:
@@ -96,11 +111,16 @@ def run():
     print(f"bytes        : {len(buf)}")
     print(f"prompt seen  : {saw_prompt}")
     print(f"marker echoed: {saw_marker}")
+    print(f"second echoed: {saw_second}")
+    print(f"shell exited : {exited_early}")
     print(f"tail         : {bytes(buf[-260:])!r}")
-    if saw_prompt and saw_marker:
+    if saw_prompt and saw_marker and saw_second and not exited_early:
         print("RESULT: PASS")
         return 0
-    print("RESULT: FAIL (frozen after execve)")
+    if exited_early:
+        print("RESULT: FAIL (shell exited before the session was finished)")
+    else:
+        print("RESULT: FAIL (frozen after execve)")
     return 2
 
 
