@@ -14,6 +14,11 @@
 #include <sys/stat.h>
 #include <elf.h>
 #include <signal.h>
+#include <termios.h>
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 #ifndef NT_PRSTATUS
 #define NT_PRSTATUS 1
@@ -147,6 +152,28 @@ typedef struct user_regs_struct arch_regs_t;
 #define SET_ARCH_ARG2(regs, val) ((regs).ecx = (unsigned long)(val))
 #endif
 
+// ---------------- Diagnostics ----------------
+//
+// The supervisor shares the PTY with the guest shell, so anything it prints to
+// stdout/stderr lands in the middle of the shell's output stream and corrupts
+// the terminal. Diagnostics go to Android logcat instead:
+//     adb logcat -s VPortableSupervisor
+// On the host build (used by the headless regression test) they go to stderr,
+// which is the terminal the test drives.
+#define SUP_TAG "VPortableSupervisor"
+
+#if defined(__ANDROID__)
+#define sup_log(level, ...) \
+    __android_log_print(level, SUP_TAG, __VA_ARGS__)
+#else
+#define sup_log(level, ...) \
+    do { fprintf(stderr, "[%s] ", SUP_TAG); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
+#endif
+
+#define SUP_INFO(...)  sup_log(ANDROID_LOG_INFO, __VA_ARGS__)
+#define SUP_WARN(...)  sup_log(ANDROID_LOG_WARN, __VA_ARGS__)
+#define SUP_ERROR(...) sup_log(ANDROID_LOG_ERROR, __VA_ARGS__)
+
 // ---------------- Process Tracking & Process Group Cleanup ----------------
 #define MAX_TRACKED_PIDS 64
 typedef struct {
@@ -208,8 +235,53 @@ static void cleanup_process_group(void) {
     }
 }
 
+// Hand the controlling terminal back to the supervisor's process group. Must be
+// called with SIGTTOU ignored, otherwise the call itself suspends us.
+static void restore_terminal_foreground(void) {
+    if (isatty(STDIN_FILENO)) {
+        tcsetpgrp(STDIN_FILENO, getpgrp());
+    }
+}
+
+// Move the controlling terminal to `pgid` and confirm the kernel accepted it.
+// SIGTTOU must already be ignored, otherwise this call suspends us when we are
+// not the current foreground group. Returns 1 on success.
+static int acquire_terminal_foreground(pid_t pgid) {
+    if (tcsetpgrp(STDIN_FILENO, pgid) != 0) {
+        return 0;
+    }
+    return tcgetpgrp(STDIN_FILENO) == pgid;
+}
+
+// Guarantee the traced shell can read the terminal.
+//
+// The child joins its own process group so the supervisor can keep job control
+// isolated, but a shell left in a background group has its first read()
+// SIGTTIN-suspended and the whole session appears frozen. If the terminal
+// handover fails for any reason, put the child back into the supervisor's
+// (foreground) group instead of silently freezing.
+static void establish_terminal_foreground(pid_t child) {
+    if (!isatty(STDIN_FILENO)) {
+        return;
+    }
+    signal(SIGTTOU, SIG_IGN);
+    if (acquire_terminal_foreground(child)) {
+        return;
+    }
+    if (setpgid(child, getpgrp()) == 0) {
+        SUP_WARN("could not give the terminal to pgid %d (%s); sharing the "
+                 "supervisor's process group so input still reaches the shell",
+                 child, strerror(errno));
+    } else {
+        SUP_ERROR("terminal handover to pgid %d failed (%s) and the fallback also "
+                  "failed (%s); interactive input may not work",
+                  child, strerror(errno), strerror(errno));
+    }
+}
+
 static void signal_handler(int sig) {
     cleanup_process_group();
+    restore_terminal_foreground();
     _exit(128 + sig);
 }
 
@@ -223,18 +295,15 @@ typedef struct {
 static mount_entry_t mount_table[MOUNT_TABLE_SIZE];
 
 static void init_mount_table(const char *rootfs_dir) {
-    // 0. Binary paths
     mount_table[0].guest_prefix = "/bin";
     snprintf(mount_table[0].host_target, sizeof(mount_table[0].host_target), "%s/bin", rootfs_dir);
 
     mount_table[1].guest_prefix = "/sbin";
     snprintf(mount_table[1].host_target, sizeof(mount_table[1].host_target), "%s/sbin", rootfs_dir);
 
-    // 1. User hierarchy (Crucial for Alpine tools)
     mount_table[2].guest_prefix = "/usr";
     snprintf(mount_table[2].host_target, sizeof(mount_table[2].host_target), "%s/usr", rootfs_dir);
 
-    // 2. Configuration & Libraries
     mount_table[3].guest_prefix = "/etc";
     snprintf(mount_table[3].host_target, sizeof(mount_table[3].host_target), "%s/etc", rootfs_dir);
 
@@ -244,7 +313,6 @@ static void init_mount_table(const char *rootfs_dir) {
     mount_table[5].guest_prefix = "/lib";
     snprintf(mount_table[5].host_target, sizeof(mount_table[5].host_target), "%s/lib", rootfs_dir);
 
-    // 3. State & Temp
     mount_table[6].guest_prefix = "/var";
     snprintf(mount_table[6].host_target, sizeof(mount_table[6].host_target), "%s/var", rootfs_dir);
 
@@ -270,7 +338,6 @@ static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size
     return 0;
 }
 
-// Helper: resolve relative path against process CWD
 static void resolve_relative_or_absolute(const char *in_path, const char *cwd, char *out_path, size_t out_size) {
     if (in_path[0] == '/') {
         strncpy(out_path, in_path, out_size - 1);
@@ -284,7 +351,6 @@ static void resolve_relative_or_absolute(const char *in_path, const char *cwd, c
     }
 }
 
-// Helper: resolve dirfd and relative path
 static void resolve_dirfd_and_path(pid_t pid, long dirfd, const char *raw_path, const char *cwd, char *out_path, size_t out_size) {
     if (raw_path[0] == '/' || dirfd == AT_FDCWD) {
         char full_virtual[1024] = {0};
@@ -306,9 +372,7 @@ static void resolve_dirfd_and_path(pid_t pid, long dirfd, const char *raw_path, 
             } else {
                 snprintf(combined, sizeof(combined), "%s/%s", dir_target, raw_path);
             }
-            if (resolve_vfs_path(combined, out_path, out_size)) {
-                // Resolved virtual path to host target
-            } else {
+            if (!resolve_vfs_path(combined, out_path, out_size)) {
                 strncpy(out_path, combined, out_size - 1);
                 out_path[out_size - 1] = '\0';
             }
@@ -323,7 +387,6 @@ static void resolve_dirfd_and_path(pid_t pid, long dirfd, const char *raw_path, 
     }
 }
 
-// ---------------- Memory & Reg Helpers ----------------
 static int get_child_regs(pid_t child, arch_regs_t *regs) {
     struct iovec iov = { .iov_base = regs, .iov_len = sizeof(*regs) };
     return ptrace(PTRACE_GETREGSET, child, (void*)(uintptr_t)NT_PRSTATUS, &iov);
@@ -361,7 +424,51 @@ static void ensure_argv0(pid_t child, uintptr_t argv_ptr, uintptr_t sh_addr, con
     }
 }
 
-// ---------------- Main Supervisor Logic ----------------
+// Verify that a helper binary really matches the CPU we are running on before we
+// hand the shell over to it. BusyBox is shipped as an Android native library
+// (libbusybox.so) so it is stored uncompressed and executable, which means the
+// build system never checks it; a mislabelled binary only shows up at exec time
+// as ENOEXEC, and by then the shell is already gone. Returns 0 when the ELF
+// matches the host ABI, -1 otherwise (with the reason logged).
+static int verify_native_abi(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        SUP_ERROR("cannot open %s: %s", path, strerror(errno));
+        return -1;
+    }
+
+    unsigned char hdr[EI_NIDENT];
+    if (read(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) ||
+        memcmp(hdr, ELFMAG, SELFMAG) != 0) {
+        SUP_ERROR("%s is not an ELF binary", path);
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+#if defined(__aarch64__)
+    const int want_class = ELFCLASS64;
+    const char *want_name = "AArch64";
+#elif defined(__x86_64__)
+    const int want_class = ELFCLASS64;
+    const char *want_name = "x86-64";
+#elif defined(__arm__)
+    const int want_class = ELFCLASS32;
+    const char *want_name = "ARM";
+#else
+    const int want_class = ELFCLASS32;
+    const char *want_name = "x86";
+#endif
+
+    if (hdr[EI_CLASS] != want_class) {
+        SUP_ERROR("%s has the wrong ABI: this device is %s (ELF%d) but the binary "
+                  "is ELF%d; the shell cannot start", path, want_name, want_class * 32,
+                  hdr[EI_CLASS] * 32);
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr, "USAGE: %s <rootfs_dir> <native_lib_dir> <command> [args...]\n", argv[0]);
@@ -375,16 +482,32 @@ int main(int argc, char *argv[]) {
 
     init_mount_table(rootfs_dir);
 
+    // Fail loudly and early if the shell binary is present but cannot possibly
+    // run here. Doing this before forking keeps the diagnostic out of the
+    // guest's terminal. A missing binary is not fatal: the caller has its own
+    // fallback chain.
+    char busybox_probe[2048];
+    snprintf(busybox_probe, sizeof(busybox_probe), "%s/libbusybox.so", native_lib_dir);
+    if (access(busybox_probe, R_OK) == 0 && verify_native_abi(busybox_probe) != 0) {
+        SUP_ERROR("refusing to start: %s is not executable on this device", busybox_probe);
+        return 1;
+    }
+
     pid_t child = fork();
     if (child < 0) return 1;
 
     if (child == 0) {
-        // Child Process
-        setpgid(0, 0);
+        // Child Process: Join a new process group. The controlling terminal is
+        // transferred to this group by the supervisor *after* the child stops;
+        // calling tcsetpgrp() here would raise SIGTTOU and strand the shell in
+        // the background, where its first read() gets SIGTTIN-suspended.
+        if (isatty(STDIN_FILENO)) {
+            setpgid(0, 0);
+        }
 
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
-            perror("ptrace PTRACE_TRACEME failed");
-            exit(1);
+            SUP_ERROR("PTRACE_TRACEME failed: %s", strerror(errno));
+            _exit(1);
         }
         raise(SIGSTOP);
 
@@ -392,7 +515,7 @@ int main(int argc, char *argv[]) {
         setvbuf(stderr, NULL, _IONBF, 0);
 
         execv(command, cmd_argv);
-        perror("execv failed in child");
+        SUP_ERROR("execv(%s) failed: %s", command, strerror(errno));
         _exit(127);
     }
 
@@ -400,6 +523,13 @@ int main(int argc, char *argv[]) {
     g_child_pgid = child;
     memset(pid_table, 0, sizeof(pid_table));
     get_or_create_pid(child);
+
+    // The supervisor is a background process with respect to the terminal it
+    // owns, so any terminal bookkeeping it performs (tcsetpgrp, writing while
+    // not the foreground group) would raise SIGTTOU/SIGTTIN and suspend it,
+    // which looks exactly like a hung session. Ignore both for our lifetime.
+    signal(SIGTTOU, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -410,6 +540,11 @@ int main(int argc, char *argv[]) {
         cleanup_process_group();
         return 1;
     }
+
+    // The child is stopped in PTRACE_TRACEME. Only now is it safe for the
+    // supervisor to move the controlling terminal to the child's process group:
+    // doing it while the child still shares our group would fail.
+    establish_terminal_foreground(child);
 
     unsigned long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | 
                             PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE | 
@@ -427,7 +562,14 @@ int main(int argc, char *argv[]) {
         pid_state_t *ps = get_or_create_pid(cur_pid);
         if (!ps) continue;
 
-        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+        if (WIFEXITED(status)) {
+            SUP_INFO("Child PID %d exited with code %d", cur_pid, WEXITSTATUS(status));
+            remove_pid(cur_pid);
+            continue;
+        }
+        if (WIFSIGNALED(status)) {
+            int termsig = WTERMSIG(status);
+            SUP_ERROR("Child PID %d killed by signal %d (%s)", cur_pid, termsig, strsignal(termsig));
             remove_pid(cur_pid);
             continue;
         }
@@ -445,8 +587,7 @@ int main(int argc, char *argv[]) {
                     if (new_ps) {
                         strncpy(new_ps->cwd, ps->cwd, sizeof(new_ps->cwd));
                     }
-                    printf("SUPERVISOR: Attached to child PID=%lu (inherited CWD=%s)\n", new_child, ps->cwd);
-                    fflush(stdout);
+                    SUP_INFO("Attached to child PID=%lu (inherited CWD=%s)", new_child, ps->cwd);
                 }
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
                 continue;
@@ -506,9 +647,8 @@ int main(int argc, char *argv[]) {
                                         if (scr != 0) {
                                             SET_ARCH_ARG2(regs, scr);
                                             set_child_regs(cur_pid, &regs);
-                                            printf("SUPERVISOR [PID=%d]: Redirected %s %s -> %s\n",
-                                                   cur_pid, (nr == __NR_openat ? "openat" : "newfstatat"), raw_path, rew_path);
-                                            fflush(stdout);
+                                            SUP_INFO("PID %d: redirected %s %s -> %s",
+                                                     cur_pid, (nr == __NR_openat ? "openat" : "newfstatat"), raw_path, rew_path);
                                         }
                                     }
                                 }
@@ -532,9 +672,8 @@ int main(int argc, char *argv[]) {
                                             SET_ARCH_ARG1(regs, scr);
                                             ensure_argv0(cur_pid, ARCH_ARG2(regs), scr, applet);
                                             set_child_regs(cur_pid, &regs);
-                                            printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s (applet=%s)\n",
-                                                   cur_pid, full_virtual, busybox_path, applet);
-                                            fflush(stdout);
+                                            SUP_INFO("PID %d: redirected execve %s -> %s (applet=%s)",
+                                                     cur_pid, full_virtual, busybox_path, applet);
                                         }
                                     } else {
                                         char rew_path[2048] = {0};
@@ -545,9 +684,8 @@ int main(int argc, char *argv[]) {
                                             if (scr != 0) {
                                                 SET_ARCH_ARG1(regs, scr);
                                                 set_child_regs(cur_pid, &regs);
-                                                printf("SUPERVISOR [PID=%d]: Redirected execve %s -> %s\n",
-                                                       cur_pid, full_virtual, rew_path);
-                                                fflush(stdout);
+                                                SUP_INFO("PID %d: redirected execve %s -> %s",
+                                                         cur_pid, full_virtual, rew_path);
                                             }
                                         }
                                     }
@@ -559,8 +697,7 @@ int main(int argc, char *argv[]) {
                         if (ps->last_syscall == __NR_chdir && ps->pending_chdir[0] != '\0') {
                             if (ARCH_RET(regs) == 0) {
                                 strncpy(ps->cwd, ps->pending_chdir, sizeof(ps->cwd));
-                                printf("SUPERVISOR [PID=%d]: chdir successful, updated CWD=%s\n", cur_pid, ps->cwd);
-                                fflush(stdout);
+                                SUP_INFO("PID %d: chdir ok, CWD=%s", cur_pid, ps->cwd);
                             }
                             ps->pending_chdir[0] = '\0';
                         }
@@ -573,26 +710,16 @@ int main(int argc, char *argv[]) {
             } else if (sig == SIGSTOP) {
                 ptrace(PTRACE_SETOPTIONS, cur_pid, NULL, (void*)options);
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
+            } else if (sig == SIGTTIN || sig == SIGTTOU) {
+                // Do NOT suspend or kill interactive shell on TTY control signals
+                ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else {
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, (void*)(uintptr_t)sig);
             }
         }
     }
 
-    // Print Alpine Boot Marker and dump /etc/os-release metadata
-    printf("VPORTABLE_ALPINE_BOOT_OK\n");
-    char os_release_path[2048] = {0};
-    snprintf(os_release_path, sizeof(os_release_path), "%s/etc/os-release", rootfs_dir);
-    FILE *f = fopen(os_release_path, "r");
-    if (f) {
-        char line_buf[512];
-        while (fgets(line_buf, sizeof(line_buf), f)) {
-            printf("%s", line_buf);
-        }
-        fclose(f);
-    }
-    fflush(stdout);
-
     cleanup_process_group();
+    restore_terminal_foreground();
     return 0;
 }
