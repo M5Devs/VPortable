@@ -24,8 +24,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -37,11 +35,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -50,6 +48,18 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+
+private val TermuxBackground = Color(0xFF000000)
+private val TermuxForeground = Color(0xFFF8F8F2)
+private val TermuxGreen = Color(0xFF50FA7B)
+private val TermuxRed = Color(0xFFFF5555)
+private val TermuxAmber = Color(0xFFFFB86C)
+private val TermuxStatusBar = Color(0xFF1A1A1A)
+private val TermuxToolbar = Color(0xFF2D2D2D)
+private val TermuxKey = Color(0xFF3D3D3D)
+private val TermuxKeyText = Color(0xFFE0E0E0)
+private val TermuxEnterBackground = Color(0xFF1A472A)
+private val TermuxKillBackground = Color(0xFF3D1515)
 
 @Composable
 fun TerminalScreen(
@@ -94,7 +104,7 @@ fun TerminalScreen(
         }
     }
 
-    // Blinking cursor animation (Termux style █)
+    // Blinking cursor animation (Termux style block)
     val infiniteTransition = rememberInfiniteTransition(label = "cursor")
     val cursorAlpha by infiniteTransition.animateFloat(
         initialValue = 1f,
@@ -109,66 +119,14 @@ fun TerminalScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF000000))
+            .background(TermuxBackground)
     ) {
-        // Minimal Sleek Header
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF0D0D0D))
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .background(
-                            if (state.isTerminalActive) Color(0xFF00FF66) else Color(0xFFFF5252),
-                            shape = CircleShape
-                        )
-                )
-                Text(
-                    text = if (state.isTerminalActive) "VPortable Terminal (Alpine Linux v3.24)" else "Terminal Offline",
-                    color = Color.LightGray,
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Medium
-                )
-            }
-
-            if (state.isExtractingRootfs) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    color = Color(0xFF00FF66),
-                    strokeWidth = 2.dp
-                )
-            } else if (!state.isTerminalActive) {
-                Button(
-                    onClick = { viewModel.startTerminal(context) },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
-                    shape = RoundedCornerShape(4.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                    modifier = Modifier.height(28.dp)
-                ) {
-                    Text("Boot Alpine", color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                }
-            } else {
-                Button(
-                    onClick = { viewModel.closeTerminal() },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
-                    shape = RoundedCornerShape(4.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                    modifier = Modifier.height(28.dp)
-                ) {
-                    Text("Exit", color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                }
-            }
-        }
+        TerminalStatusBar(
+            isActive = state.isTerminalActive,
+            isExtracting = state.isExtractingRootfs,
+            onStart = { viewModel.startTerminal(context) },
+            onKill = { viewModel.closeTerminal() }
+        )
 
         // Auto-scrolling terminal canvas
         val scrollState = rememberScrollState()
@@ -188,12 +146,11 @@ fun TerminalScreen(
                 .focusRequester(inputFocusRequester)
         )
 
-        // Main Terminal Canvas Display
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .background(Color(0xFF000000))
+                .background(TermuxBackground)
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null
@@ -202,53 +159,45 @@ fun TerminalScreen(
                         focusInput()
                     }
                 }
-                .padding(horizontal = 10.dp, vertical = 6.dp)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
         ) {
-            if (state.terminalOutput.isEmpty() && !state.isTerminalActive) {
+            val idlePrompt = state.terminalOutput.isEmpty() && !state.isTerminalActive
+
+            SelectionContainer {
                 Text(
-                    text = "VPortable Container Runtime\n" +
-                            "Tap 'Boot Alpine' above to launch interactive rootfs shell...\n\n" +
-                            "Status: ${state.statusMessage}",
-                    color = Color.DarkGray,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp,
-                    lineHeight = 17.sp
-                )
-            } else {
-                SelectionContainer {
-                    Text(
-                        // The cursor is concatenated into the output text. A sibling
-                        // Text in a Row would be pushed off-screen by the full-width
-                        // multi-line output above it.
-                        text = if (state.isTerminalActive) {
-                            buildAnnotatedString {
-                                append(state.terminalOutput)
-                                withStyle(SpanStyle(color = Color(0xFF00FF66).copy(alpha = cursorAlpha))) {
-                                    append("█")
-                                }
-                            }
+                    // The cursor is concatenated into the output text. A sibling
+                    // Text in a Row would be pushed off-screen by the full-width
+                    // multi-line output above it.
+                    text = buildAnnotatedString {
+                        if (idlePrompt) {
+                            withStyle(SpanStyle(color = TermuxGreen)) { append("~ $") }
                         } else {
-                            AnnotatedString(state.terminalOutput)
-                        },
-                        color = Color(0xFF00FF66), // Termux Matrix Green
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.sp,
-                        lineHeight = 16.sp,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .verticalScroll(scrollState)
-                    )
-                }
+                            append(state.terminalOutput)
+                        }
+                        if (state.isTerminalActive || idlePrompt) {
+                            withStyle(SpanStyle(color = TermuxForeground.copy(alpha = cursorAlpha))) {
+                                append("█")
+                            }
+                        }
+                    },
+                    color = TermuxForeground,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(scrollState)
+                )
             }
         }
 
-        // Termux-Style Extra Keys Toolbar (With ENTER Key ↵)
+        // Termux-Style Extra Keys Toolbar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFF141414))
+                .background(TermuxToolbar)
                 .padding(horizontal = 4.dp, vertical = 3.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
+            horizontalArrangement = Arrangement.spacedBy(3.dp)
         ) {
             val keyModifier = Modifier
                 .weight(1f)
@@ -280,7 +229,6 @@ fun TerminalScreen(
             TermuxKeyButton("CLS", keyModifier) {
                 viewModel.clearScreen()
             }
-            // زرار الـ ENTER المباشر باللون الأخضر الشياكة!
             TermuxKeyButton("↵", keyModifier, isEnter = true) {
                 viewModel.sendEnter()
                 focusInput()
@@ -290,25 +238,113 @@ fun TerminalScreen(
 }
 
 @Composable
+private fun TerminalStatusBar(
+    isActive: Boolean,
+    isExtracting: Boolean,
+    onStart: () -> Unit,
+    onKill: () -> Unit
+) {
+    val label = when {
+        isActive -> "vportable ~ pts/0"
+        isExtracting -> "extracting rootfs..."
+        else -> "no session"
+    }
+    val labelColor = when {
+        isActive -> TermuxGreen
+        isExtracting -> TermuxAmber
+        else -> TermuxRed
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(32.dp)
+            .background(TermuxStatusBar)
+            .padding(horizontal = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .background(if (isActive) TermuxGreen else TermuxRed, CircleShape)
+            )
+            Text(
+                text = label,
+                color = labelColor,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                maxLines = 1
+            )
+        }
+
+        when {
+            isExtracting -> CircularProgressIndicator(
+                modifier = Modifier.size(14.dp),
+                color = TermuxAmber,
+                strokeWidth = 2.dp
+            )
+
+            isActive -> StatusBarButton(
+                label = "KILL",
+                background = TermuxKillBackground,
+                contentColor = TermuxRed,
+                onClick = onKill
+            )
+
+            else -> StatusBarButton(
+                label = "NEW SESSION",
+                background = TermuxEnterBackground,
+                contentColor = TermuxGreen,
+                onClick = onStart
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatusBarButton(
+    label: String,
+    background: Color,
+    contentColor: Color,
+    onClick: () -> Unit
+) {
+    Text(
+        text = label,
+        color = contentColor,
+        fontSize = 11.sp,
+        fontFamily = FontFamily.Monospace,
+        maxLines = 1,
+        modifier = Modifier
+            .clip(RoundedCornerShape(2.dp))
+            .background(background)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 2.dp)
+    )
+}
+
+@Composable
 private fun TermuxKeyButton(
     label: String,
     modifier: Modifier = Modifier,
     isEnter: Boolean = false,
     onClick: () -> Unit
 ) {
-    Button(
-        onClick = onClick,
-        colors = ButtonDefaults.buttonColors(
-            containerColor = if (isEnter) Color(0xFF1B5E20) else Color(0xFF222222),
-            contentColor = if (isEnter) Color(0xFF00FF66) else Color(0xFFE0E0E0)
-        ),
-        shape = RoundedCornerShape(2.dp),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+    Box(
         modifier = modifier
+            .clip(RoundedCornerShape(3.dp))
+            .background(if (isEnter) TermuxEnterBackground else TermuxKey)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
     ) {
         Text(
             text = label,
-            fontSize = if (isEnter) 14.sp else 10.sp,
+            color = if (isEnter) TermuxGreen else TermuxKeyText,
+            fontSize = if (isEnter) 13.sp else 10.sp,
             fontWeight = FontWeight.Bold,
             fontFamily = FontFamily.Monospace
         )
