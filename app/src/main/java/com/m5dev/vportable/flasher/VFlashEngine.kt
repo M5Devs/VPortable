@@ -14,7 +14,10 @@ import java.util.zip.GZIPInputStream
  */
 object VFlashEngine {
 
-    const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-x86_64.tar"
+    // AGP gunzips ".gz" assets and drops the suffix at packaging time, so the
+    // APK entry is "rootfs/alpine-minirootfs-aarch64.tar" even though the
+    // source asset is stored as ".tar.gz".
+    const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-aarch64.tar"
 
     /**
      * Extracts an Alpine (or generic tar.gz) rootfs archive directly into context.filesDir/rootfs.

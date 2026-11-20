@@ -27,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -40,11 +41,15 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -146,48 +151,51 @@ fun TerminalScreen(
                 .focusRequester(inputFocusRequester)
         )
 
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .background(TermuxBackground)
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null
-                ) {
-                    if (state.isTerminalActive) {
-                        focusInput()
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .background(TermuxBackground)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) {
+                        if (state.isTerminalActive) {
+                            focusInput()
+                        }
                     }
-                }
-                .padding(horizontal = 8.dp, vertical = 4.dp)
-        ) {
-            val idlePrompt = state.terminalOutput.isEmpty() && !state.isTerminalActive
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                val idlePrompt = state.terminalOutput.isEmpty() && !state.isTerminalActive
 
-            SelectionContainer {
-                Text(
-                    // The cursor is concatenated into the output text. A sibling
-                    // Text in a Row would be pushed off-screen by the full-width
-                    // multi-line output above it.
-                    text = buildAnnotatedString {
-                        if (idlePrompt) {
-                            withStyle(SpanStyle(color = TermuxGreen)) { append("~ $") }
-                        } else {
-                            append(state.terminalOutput)
-                        }
-                        if (state.isTerminalActive || idlePrompt) {
-                            withStyle(SpanStyle(color = TermuxForeground.copy(alpha = cursorAlpha))) {
-                                append("█")
+                SelectionContainer {
+                    Text(
+                        // The cursor is concatenated into the output text. A sibling
+                        // Text in a Row would be pushed off-screen by the full-width
+                        // multi-line output above it.
+                        text = buildAnnotatedString {
+                            if (idlePrompt) {
+                                withStyle(SpanStyle(color = TermuxGreen)) { append("~ $") }
+                            } else {
+                                append(state.terminalOutput)
                             }
-                        }
-                    },
-                    color = TermuxForeground,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
-                    lineHeight = 18.sp,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(scrollState)
-                )
+                            if (state.isTerminalActive || idlePrompt) {
+                                withStyle(SpanStyle(color = TermuxForeground.copy(alpha = cursorAlpha))) {
+                                    append("█")
+                                }
+                            }
+                        },
+                        color = TermuxForeground,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        style = TextStyle(textDirection = TextDirection.Ltr),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .verticalScroll(scrollState)
+                    )
+                }
             }
         }
 
