@@ -105,7 +105,7 @@ class TerminalViewModel @JvmOverloads constructor(
                         if (clean.isEmpty()) return@collect
                         Log.d(TAG, "nativeRead -> ${clean.length} chars")
                         _uiState.value = _uiState.value.copy(
-                            terminalOutput = _uiState.value.terminalOutput + clean
+                            terminalOutput = applyBackspace(_uiState.value.terminalOutput + clean)
                         )
                     }
                 } catch (t: Throwable) {
@@ -128,6 +128,31 @@ class TerminalViewModel @JvmOverloads constructor(
     private fun processAnsi(rawText: String): String {
         // Strip ANSI escape codes for clean monospaced rendering
         return rawText.replace(Regex("\u001B\\[[;\\d]*[A-Za-z]"), "")
+    }
+
+    /**
+     * Applies the erase sequence the tty echoes when a key is deleted (the
+     * terminal sends BS then CSI-erase-down) to the text already on screen. The
+     * output is one growing string rendered by a plain Text, so without this the
+     * backspace was appended verbatim and the erased character stayed visible.
+     * Must run over the whole accumulated buffer, not per chunk: the echo of a
+     * delete routinely arrives in a later read() than the character it erases.
+     * Idempotent, since the result contains no backspace.
+     */
+    private fun applyBackspace(text: String): String {
+        if (text.indexOf('\b') < 0) return text
+
+        val sb = StringBuilder(text.length)
+        for (ch in text) {
+            when (ch) {
+                '\b' -> if (sb.isNotEmpty() && sb[sb.length - 1] != '\n') {
+                    sb.setLength(sb.length - 1)
+                }
+                '\u0007', '\u0000' -> Unit
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString()
     }
 
     fun sendRawInput(text: String) {

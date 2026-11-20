@@ -15,6 +15,8 @@
 #include <elf.h>
 #include <signal.h>
 #include <termios.h>
+#include <dirent.h>
+#include <limits.h>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -90,6 +92,40 @@
 #endif
 #endif
 
+// aarch64 and arm have no legacy open/stat/lstat (only the *at variants). On
+// those targets the values are set to an impossible syscall number so the
+// comparisons below still compile and are permanently false, rather than
+// needing preprocessor guards inside the dispatch chain.
+#ifndef __NR_open
+#if defined(__x86_64__)
+#define __NR_open 2
+#elif defined(__i386__)
+#define __NR_open 5
+#else
+#define __NR_open (-1)
+#endif
+#endif
+
+#ifndef __NR_stat
+#if defined(__x86_64__)
+#define __NR_stat 4
+#elif defined(__i386__)
+#define __NR_stat 106
+#else
+#define __NR_stat (-1)
+#endif
+#endif
+
+#ifndef __NR_lstat
+#if defined(__x86_64__)
+#define __NR_lstat 6
+#elif defined(__i386__)
+#define __NR_lstat 107
+#else
+#define __NR_lstat (-1)
+#endif
+#endif
+
 #ifndef __NR_execve
 #if defined(__x86_64__)
 #define __NR_execve 59
@@ -109,6 +145,16 @@
 #define __NR_chdir 49
 #elif defined(__i386__) || defined(__arm__)
 #define __NR_chdir 12
+#endif
+#endif
+
+#ifndef __NR_getcwd
+#if defined(__x86_64__)
+#define __NR_getcwd 79
+#elif defined(__aarch64__)
+#define __NR_getcwd 17
+#elif defined(__i386__) || defined(__arm__)
+#define __NR_getcwd 183
 #endif
 #endif
 
@@ -293,8 +339,85 @@ typedef struct {
 } mount_entry_t;
 
 static mount_entry_t mount_table[MOUNT_TABLE_SIZE];
+static char g_rootfs_dir[1024];
+
+// Alpine's minirootfs applets are absolute symlinks into /bin/busybox
+// ("ls -> /bin/busybox"). The kernel resolves a symlink target against the real
+// filesystem, not our mount table, so every such applet pointed at the device's
+// /bin and the shell reported "ls: not found" once path rewriting started
+// working. Rewrite each absolute link to a relative one so it resolves inside
+// the rootfs. Idempotent: relative links are left alone, so repeated sessions
+// are cheap.
+static void relativize_symlinks(const char *dir_path) {
+    DIR *dir = opendir(dir_path);
+    if (!dir) return;
+
+    // Depth of dir_path below the rootfs, e.g. "<rootfs>/usr/lib" -> 2. Counted
+    // from the rootfs prefix, not from the absolute path, or the resulting
+    // "../.." chain would climb past the container root onto the host.
+    size_t root_len = strlen(g_rootfs_dir);
+    int depth = 0;
+    if (strncmp(dir_path, g_rootfs_dir, root_len) == 0) {
+        for (const char *p = dir_path + root_len; *p; p++) {
+            if (*p == '/') depth++;
+        }
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) >= (int) sizeof(full)) continue;
+
+        struct stat lst;
+        if (lstat(full, &lst) != 0) continue;
+
+        if (S_ISDIR(lst.st_mode)) {
+            relativize_symlinks(full);
+            continue;
+        }
+        if (!S_ISLNK(lst.st_mode)) continue;
+
+        char target[PATH_MAX];
+        ssize_t len = readlink(full, target, sizeof(target) - 1);
+        if (len <= 0) continue;
+        target[len] = '\0';
+
+        // Already relative: resolves inside the rootfs on its own.
+        if (target[0] != '/') continue;
+
+        char relative[PATH_MAX];
+        size_t off = 0;
+        relative[0] = '\0';
+        for (int i = 0; i < depth && off + 3 < sizeof(relative); i++) {
+            relative[off++] = '.';
+            relative[off++] = '.';
+            relative[off++] = '/';
+        }
+        relative[off] = '\0';
+
+        // "/bin/busybox" -> "bin/busybox" so the "../" prefix is not doubled.
+        const char *stripped = target;
+        while (*stripped == '/') stripped++;
+
+        char new_target[PATH_MAX];
+        if (snprintf(new_target, sizeof(new_target), "%s%s", relative, stripped) >= (int) sizeof(new_target)) continue;
+
+        char tmp_link[PATH_MAX + 8];
+        if (snprintf(tmp_link, sizeof(tmp_link), "%s.vpnew", full) >= (int) sizeof(tmp_link)) continue;
+
+        unlink(tmp_link);
+        if (symlink(new_target, tmp_link) == 0 && rename(tmp_link, full) != 0) {
+            unlink(tmp_link);
+        }
+    }
+    closedir(dir);
+}
 
 static void init_mount_table(const char *rootfs_dir) {
+    snprintf(g_rootfs_dir, sizeof(g_rootfs_dir), "%s", rootfs_dir);
+
     mount_table[0].guest_prefix = "/bin";
     snprintf(mount_table[0].host_target, sizeof(mount_table[0].host_target), "%s/bin", rootfs_dir);
 
@@ -320,9 +443,26 @@ static void init_mount_table(const char *rootfs_dir) {
     snprintf(mount_table[7].host_target, sizeof(mount_table[7].host_target), "%s/tmp", rootfs_dir);
 }
 
+static int is_host_path(const char *in_path) {
+    // Paths the Android runtime itself needs must keep resolving against the
+    // real filesystem: the dynamic linker, /proc for introspection, the PTY
+    // device nodes and the app's own data directory all live on the host.
+    static const char *host_prefixes[] = {
+        "/system", "/apex", "/vendor", "/product", "/proc", "/dev",
+        "/sys", "/data", "/storage", "/mnt"
+    };
+    for (size_t i = 0; i < sizeof(host_prefixes) / sizeof(host_prefixes[0]); i++) {
+        size_t plen = strlen(host_prefixes[i]);
+        if (strncmp(in_path, host_prefixes[i], plen) == 0 &&
+            (in_path[plen] == '/' || in_path[plen] == '\0')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
-    // Keep host system /system path pass-through for Bionic runtime dependencies
-    if (strncmp(in_path, "/system", 7) == 0 && (in_path[7] == '/' || in_path[7] == '\0')) {
+    if (is_host_path(in_path)) {
         return 0;
     }
 
@@ -334,6 +474,16 @@ static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size
                 return 1;
             }
         }
+    }
+
+    // Anything else is a guest-absolute path: map it under the rootfs so that
+    // "/" is the container root rather than the device root. Without this a
+    // bare "ls /" or an unmapped "/etc/os-release" hit the host filesystem,
+    // which is why the shell reported "Permission denied" on "/" and could not
+    // find files that exist in the rootfs.
+    if (in_path[0] == '/' && g_rootfs_dir[0] != '\0') {
+        snprintf(out_path, out_size, "%s%s", g_rootfs_dir, in_path);
+        return 1;
     }
     return 0;
 }
@@ -481,6 +631,7 @@ int main(int argc, char *argv[]) {
     char **cmd_argv = &argv[3];
 
     init_mount_table(rootfs_dir);
+    relativize_symlinks(rootfs_dir);
 
     // Fail loudly and early if the shell binary is present but cannot possibly
     // run here. Doing this before forking keeps the diagnostic out of the
@@ -594,7 +745,10 @@ int main(int argc, char *argv[]) {
             }
 
             if (event == PTRACE_EVENT_EXEC) {
-                ps->in_syscall = 0;
+                // Do NOT reset in_syscall here: the execve syscall-exit stop
+                // still follows this event, and clearing the flag would make
+                // that exit look like an entry, desynchronising the
+                // entry/exit alternation for every later syscall.
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
                 continue;
             }
@@ -603,7 +757,14 @@ int main(int argc, char *argv[]) {
             if (sig == (SIGTRAP | 0x80)) {
                 arch_regs_t regs;
                 if (get_child_regs(cur_pid, &regs) == 0) {
-                    int is_entry = (ARCH_RET(regs) == -ENOSYS);
+                    // x86 kernels write -ENOSYS into the return register at
+                    // syscall entry, but aarch64/arm do not: x0 holds ARG1 at
+                    // entry, so testing it for -ENOSYS is always false and no
+                    // path was ever rewritten on arm64 devices. Alternate on
+                    // every syscall-stop instead; PTRACE_SYSCALL reports
+                    // entry/exit strictly in pairs per thread.
+                    int is_entry = !ps->in_syscall;
+                    ps->in_syscall = !ps->in_syscall;
 
                     if (is_entry) {
                         long nr = ARCH_SYSCALL_NR(regs);
@@ -649,6 +810,28 @@ int main(int argc, char *argv[]) {
                                             set_child_regs(cur_pid, &regs);
                                             SUP_INFO("PID %d: redirected %s %s -> %s",
                                                      cur_pid, (nr == __NR_openat ? "openat" : "newfstatat"), raw_path, rew_path);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (nr == __NR_open || nr == __NR_stat || nr == __NR_lstat) {
+                            // Same as openat/newfstatat but with no dirfd: the
+                            // path is always resolved against the guest cwd.
+                            uintptr_t path_addr = ARCH_ARG1(regs);
+                            if (path_addr != 0) {
+                                char raw_path[1024] = {0};
+                                struct iovec l_iov = { .iov_base = raw_path, .iov_len = sizeof(raw_path)-1 };
+                                struct iovec r_iov = { .iov_base = (void*)path_addr, .iov_len = sizeof(raw_path)-1 };
+                                if (process_vm_readv(cur_pid, &l_iov, 1, &r_iov, 1, 0) > 0) {
+                                    char rew_path[2048] = {0};
+                                    resolve_dirfd_and_path(cur_pid, AT_FDCWD, raw_path, ps->cwd, rew_path, sizeof(rew_path));
+
+                                    if (strcmp(rew_path, raw_path) != 0) {
+                                        uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
+                                        if (scr != 0) {
+                                            SET_ARCH_ARG1(regs, scr);
+                                            set_child_regs(cur_pid, &regs);
+                                            SUP_INFO("PID %d: redirected path %s -> %s", cur_pid, raw_path, rew_path);
                                         }
                                     }
                                 }
@@ -700,12 +883,38 @@ int main(int argc, char *argv[]) {
                                 SUP_INFO("PID %d: chdir ok, CWD=%s", cur_pid, ps->cwd);
                             }
                             ps->pending_chdir[0] = '\0';
+                        } else if (ps->last_syscall == __NR_getcwd && ARCH_RET(regs) > 0) {
+                            // The kernel writes the *host* path of the working
+                            // directory into the caller's buffer, so `pwd`
+                            // printed /data/user/0/<pkg>/files/rootfs. Rewrite
+                            // the rootfs prefix away to expose the guest "/".
+                            uintptr_t buf_addr = ARCH_ARG1(regs);
+                            char host_cwd[2048] = {0};
+                            if (buf_addr != 0) {
+                                struct iovec l_iov = { .iov_base = host_cwd, .iov_len = sizeof(host_cwd) - 1 };
+                                struct iovec r_iov = { .iov_base = (void*)buf_addr, .iov_len = sizeof(host_cwd) - 1 };
+                                if (process_vm_readv(cur_pid, &l_iov, 1, &r_iov, 1, 0) > 0) {
+                                    size_t root_len = strlen(g_rootfs_dir);
+                                    if (root_len > 0 && strncmp(host_cwd, g_rootfs_dir, root_len) == 0) {
+                                        const char *guest = host_cwd + root_len;
+                                        if (guest[0] != '/') guest = "/";
+                                        if (strlen(guest) + 1 <= (size_t) ARCH_RET(regs)) {
+                                            struct iovec w_l = { .iov_base = (void *)guest, .iov_len = strlen(guest) + 1 };
+                                            struct iovec w_r = { .iov_base = (void*)buf_addr, .iov_len = strlen(guest) + 1 };
+                                            process_vm_writev(cur_pid, &w_l, 1, &w_r, 1, 0);
+                                            SUP_INFO("PID %d: getcwd %s -> %s", cur_pid, host_cwd, guest);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else if (sig == SIGTRAP) {
-                ps->in_syscall = 0;
+                // A plain trap is not part of the syscall entry/exit pair, so
+                // the alternation must be left untouched here for the same
+                // reason as PTRACE_EVENT_EXEC above.
                 ptrace(PTRACE_SYSCALL, cur_pid, NULL, 0);
             } else if (sig == SIGSTOP) {
                 ptrace(PTRACE_SETOPTIONS, cur_pid, NULL, (void*)options);
