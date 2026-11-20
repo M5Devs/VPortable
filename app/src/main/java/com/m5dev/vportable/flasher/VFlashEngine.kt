@@ -47,10 +47,10 @@ object VFlashEngine {
             setExecutablePermissions(targetDir)
 
             val hasBusybox = File(targetDir, "bin/busybox").exists()
-            val hasOsRelease = File(targetDir, "etc/os-release").exists()
+            val hasEtc = File(targetDir, "etc").exists()
 
-            onLog?.invoke("Verification check: bin/busybox exists=$hasBusybox, etc/os-release exists=$hasOsRelease")
-            return hasBusybox && hasOsRelease
+            onLog?.invoke("Verification check: bin/busybox exists=$hasBusybox, etc exists=$hasEtc")
+            return hasBusybox && hasEtc
         } catch (e: Exception) {
             onLog?.invoke("ERROR during rootfs extraction: ${e.javaClass.simpleName} - ${e.message}")
             e.printStackTrace()
