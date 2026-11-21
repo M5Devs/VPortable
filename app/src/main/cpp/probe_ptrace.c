@@ -158,6 +158,35 @@
 #endif
 #endif
 
+// UID/GID syscalls. These are already defined by <sys/syscall.h> for every
+// supported target, so the numbers below are only a fallback. Note they differ
+// per architecture: 174-177 is the *aarch64* numbering and collides with
+// create_module/init_module/delete_module/get_kernel_syms on x86_64, where the
+// real values are 102/107/104/108.
+#ifndef __NR_getuid
+#if defined(__aarch64__)
+#define __NR_getuid 174
+#define __NR_geteuid 175
+#define __NR_getgid 176
+#define __NR_getegid 177
+#elif defined(__x86_64__)
+#define __NR_getuid 102
+#define __NR_geteuid 107
+#define __NR_getgid 104
+#define __NR_getegid 108
+#elif defined(__i386__)
+#define __NR_getuid 24
+#define __NR_geteuid 49
+#define __NR_getgid 47
+#define __NR_getegid 50
+#elif defined(__arm__)
+#define __NR_getuid 24
+#define __NR_geteuid 49
+#define __NR_getgid 47
+#define __NR_getegid 50
+#endif
+#endif
+
 extern char **environ;
 
 #if defined(__x86_64__)
@@ -169,6 +198,8 @@ typedef struct user_regs_struct arch_regs_t;
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).rsi)
 #define SET_ARCH_ARG1(regs, val) ((regs).rdi = (unsigned long long)(val))
 #define SET_ARCH_ARG2(regs, val) ((regs).rsi = (unsigned long long)(val))
+// The syscall return value lives in rax, NOT in the ARG1 register (rdi).
+#define SET_ARCH_RET(regs, val) ((regs).rax = (unsigned long long)(val))
 #elif defined(__aarch64__)
 typedef struct user_pt_regs arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).sp)
@@ -178,6 +209,8 @@ typedef struct user_pt_regs arch_regs_t;
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).regs[1])
 #define SET_ARCH_ARG1(regs, val) ((regs).regs[0] = (__u64)(val))
 #define SET_ARCH_ARG2(regs, val) ((regs).regs[1] = (__u64)(val))
+// On aarch64 the return value shares regs[0] with ARG1.
+#define SET_ARCH_RET(regs, val) ((regs).regs[0] = (__u64)(val))
 #elif defined(__arm__)
 typedef struct user_regs arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).uregs[13])
@@ -187,6 +220,8 @@ typedef struct user_regs arch_regs_t;
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).uregs[1])
 #define SET_ARCH_ARG1(regs, val) ((regs).uregs[0] = (unsigned long)(val))
 #define SET_ARCH_ARG2(regs, val) ((regs).uregs[1] = (unsigned long)(val))
+// On arm the return value shares uregs[0] with ARG1.
+#define SET_ARCH_RET(regs, val) ((regs).uregs[0] = (unsigned long)(val))
 #else
 typedef struct user_regs_struct arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).esp)
@@ -196,6 +231,8 @@ typedef struct user_regs_struct arch_regs_t;
 #define ARCH_ARG2(regs) ((uintptr_t)(regs).ecx)
 #define SET_ARCH_ARG1(regs, val) ((regs).ebx = (unsigned long)(val))
 #define SET_ARCH_ARG2(regs, val) ((regs).ecx = (unsigned long)(val))
+// On i386 the return value is eax; orig_eax holds the syscall number.
+#define SET_ARCH_RET(regs, val) ((regs).eax = (unsigned long)(val))
 #endif
 
 // ---------------- Diagnostics ----------------
@@ -332,7 +369,7 @@ static void signal_handler(int sig) {
 }
 
 // ---------------- Generic Mount Table (Expanded for Alpine Userland) ----------------
-#define MOUNT_TABLE_SIZE 8
+#define MOUNT_TABLE_SIZE 14
 typedef struct {
     const char *guest_prefix;
     char host_target[1024];
@@ -441,15 +478,35 @@ static void init_mount_table(const char *rootfs_dir) {
 
     mount_table[7].guest_prefix = "/tmp";
     snprintf(mount_table[7].host_target, sizeof(mount_table[7].host_target), "%s/tmp", rootfs_dir);
+
+    mount_table[8].guest_prefix = "/home";
+    snprintf(mount_table[8].host_target, sizeof(mount_table[8].host_target), "%s/home", rootfs_dir);
+
+    mount_table[9].guest_prefix = "/root";
+    snprintf(mount_table[9].host_target, sizeof(mount_table[9].host_target), "%s/root", rootfs_dir);
+
+    mount_table[10].guest_prefix = "/opt";
+    snprintf(mount_table[10].host_target, sizeof(mount_table[10].host_target), "%s/opt", rootfs_dir);
+
+    mount_table[11].guest_prefix = "/srv";
+    snprintf(mount_table[11].host_target, sizeof(mount_table[11].host_target), "%s/srv", rootfs_dir);
+
+    mount_table[12].guest_prefix = "/mnt";
+    snprintf(mount_table[12].host_target, sizeof(mount_table[12].host_target), "%s/mnt", rootfs_dir);
+
+    mount_table[13].guest_prefix = "/run";
+    snprintf(mount_table[13].host_target, sizeof(mount_table[13].host_target), "%s/run", rootfs_dir);
 }
 
 static int is_host_path(const char *in_path) {
     // Paths the Android runtime itself needs must keep resolving against the
     // real filesystem: the dynamic linker, /proc for introspection, the PTY
     // device nodes and the app's own data directory all live on the host.
+    // /mnt is deliberately absent: it is a guest directory in the rootfs, and
+    // mapping it to the host would expose the device's mount points.
     static const char *host_prefixes[] = {
         "/system", "/apex", "/vendor", "/product", "/proc", "/dev",
-        "/sys", "/data", "/storage", "/mnt"
+        "/sys", "/data", "/storage"
     };
     for (size_t i = 0; i < sizeof(host_prefixes) / sizeof(host_prefixes[0]); i++) {
         size_t plen = strlen(host_prefixes[i]);
@@ -464,6 +521,14 @@ static int is_host_path(const char *in_path) {
 static int resolve_vfs_path(const char *in_path, char *out_path, size_t out_size) {
     if (is_host_path(in_path)) {
         return 0;
+    }
+
+    // Bare "/" maps to the rootfs root so "ls /" lists the container instead of
+    // hitting the Android root and failing with EACCES. Checked before the
+    // mount-table loop because no prefix matches "/" itself.
+    if (strcmp(in_path, "/") == 0) {
+        snprintf(out_path, out_size, "%s", g_rootfs_dir);
+        return 1;
     }
 
     for (int i = 0; i < MOUNT_TABLE_SIZE; i++) {
@@ -883,6 +948,21 @@ int main(int argc, char *argv[]) {
                                 SUP_INFO("PID %d: chdir ok, CWD=%s", cur_pid, ps->cwd);
                             }
                             ps->pending_chdir[0] = '\0';
+                        } else if (ps->last_syscall == __NR_getuid  ||
+                                   ps->last_syscall == __NR_geteuid ||
+                                   ps->last_syscall == __NR_getgid  ||
+                                   ps->last_syscall == __NR_getegid) {
+                            // Fake root: report UID/GID 0 so Alpine tools and
+                            // package managers that refuse to run as a normal
+                            // user work inside the container. The return value
+                            // must be written to the *return* register, which
+                            // is rax on x86_64 rather than the ARG1 register.
+                            SET_ARCH_RET(regs, 0);
+                            set_child_regs(cur_pid, &regs);
+                            SUP_INFO("PID %d: faked %s -> 0 (root)", cur_pid,
+                                     ps->last_syscall == __NR_getuid  ? "getuid"  :
+                                     ps->last_syscall == __NR_geteuid ? "geteuid" :
+                                     ps->last_syscall == __NR_getgid  ? "getgid"  : "getegid");
                         } else if (ps->last_syscall == __NR_getcwd && ARCH_RET(regs) > 0) {
                             // The kernel writes the *host* path of the working
                             // directory into the caller's buffer, so `pwd`
