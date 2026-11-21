@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
@@ -100,6 +101,28 @@ Java_com_m5dev_vportable_terminal_TerminalBridge_nativeStartPty(
         // Child Process: Setup environment & execute VFS supervisor /bin/sh -i
         if (c_rootfs && strlen(c_rootfs) > 0) {
             chdir(c_rootfs);
+
+            // The rootfs ships without /etc/resolv.conf, so name resolution
+            // fails and apk reports a "temporary error" even when the CDN is
+            // reachable. Seeding it here covers rootfs images that were
+            // extracted by something other than VFlashEngine, or whose
+            // resolv.conf was emptied.
+            char resolv_path[2048] = {0};
+            snprintf(resolv_path, sizeof(resolv_path), "%s/etc/resolv.conf", c_rootfs);
+            struct stat rst;
+            if (stat(resolv_path, &rst) != 0 || rst.st_size == 0) {
+                FILE *rf = fopen(resolv_path, "w");
+                if (rf) {
+                    fputs("nameserver 8.8.8.8\n", rf);
+                    fputs("nameserver 8.8.4.4\n", rf);
+                    fputs("nameserver 1.1.1.1\n", rf);
+                    fputs("options ndots:0\n", rf);
+                    fclose(rf);
+                    LOGI("Seeded %s (was missing or empty)", resolv_path);
+                } else {
+                    LOGE("Could not write %s: %s", resolv_path, strerror(errno));
+                }
+            }
         }
 
         setenv("TERM", "xterm-256color", 1);
