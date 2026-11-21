@@ -21,7 +21,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                targets("libprobe_ptrace.so", "vfs_shared", "vfs_dynamic_bin")
+                targets("libprobe_ptrace.so", "vfs_shared", "vfs_dynamic_bin", "vportable_pty")
             }
         }
     }
@@ -77,4 +77,18 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.0")
     testImplementation("org.mockito:mockito-core:5.10.0")
     testImplementation("org.mockito.kotlin:mockito-kotlin:5.2.1")
+}
+
+// The shell binaries under jniLibs are committed prebuilt and are exec'd at
+// runtime, so nothing else in the build would notice a wrong-ABI file. See
+// tools/check_native_abi.py for why that is fatal.
+val checkNativeAbi by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Verifies that committed native helpers match their ABI directory."
+    workingDir = rootProject.projectDir
+    commandLine("python3", "tools/check_native_abi.py", "app/src/main/jniLibs")
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(checkNativeAbi)
 }

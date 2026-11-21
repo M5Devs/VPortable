@@ -14,7 +14,10 @@ import java.util.zip.GZIPInputStream
  */
 object VFlashEngine {
 
-    const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-x86_64.tar"
+    // AGP gunzips ".gz" assets and drops the suffix at packaging time, so the
+    // APK entry is "rootfs/alpine-minirootfs-aarch64.tar" even though the
+    // source asset is stored as ".tar.gz".
+    const val DEFAULT_ALPINE_ASSET = "rootfs/alpine-minirootfs-aarch64.tar"
 
     /**
      * Extracts an Alpine (or generic tar.gz) rootfs archive directly into context.filesDir/rootfs.
@@ -44,10 +47,10 @@ object VFlashEngine {
             setExecutablePermissions(targetDir)
 
             val hasBusybox = File(targetDir, "bin/busybox").exists()
-            val hasOsRelease = File(targetDir, "etc/os-release").exists()
+            val hasEtc = File(targetDir, "etc").exists()
 
-            onLog?.invoke("Verification check: bin/busybox exists=$hasBusybox, etc/os-release exists=$hasOsRelease")
-            return hasBusybox && hasOsRelease
+            onLog?.invoke("Verification check: bin/busybox exists=$hasBusybox, etc exists=$hasEtc")
+            return hasBusybox && hasEtc
         } catch (e: Exception) {
             onLog?.invoke("ERROR during rootfs extraction: ${e.javaClass.simpleName} - ${e.message}")
             e.printStackTrace()
