@@ -202,15 +202,19 @@ typedef struct user_regs_struct arch_regs_t;
 #define SET_ARCH_RET(regs, val) ((regs).rax = (unsigned long long)(val))
 #elif defined(__aarch64__)
 typedef struct user_pt_regs arch_regs_t;
-#define ARCH_SP(regs) ((uintptr_t)(regs).sp)
-#define ARCH_SYSCALL_NR(regs) ((long)(regs).regs[8])
-#define ARCH_RET(regs) ((long)(regs).regs[0])
-#define ARCH_ARG1(regs) ((uintptr_t)(regs).regs[0])
-#define ARCH_ARG2(regs) ((uintptr_t)(regs).regs[1])
-#define SET_ARCH_ARG1(regs, val) ((regs).regs[0] = (__u64)(val))
-#define SET_ARCH_ARG2(regs, val) ((regs).regs[1] = (__u64)(val))
+// The parameter is deliberately NOT named "regs": struct user_pt_regs has a
+// field called regs, and the preprocessor would substitute the argument into
+// the field access as well, so these macros only worked when the argument was
+// literally spelled "regs".
+#define ARCH_SP(_r) ((uintptr_t)(_r).sp)
+#define ARCH_SYSCALL_NR(_r) ((long)(_r).regs[8])
+#define ARCH_RET(_r) ((long)(_r).regs[0])
+#define ARCH_ARG1(_r) ((uintptr_t)(_r).regs[0])
+#define ARCH_ARG2(_r) ((uintptr_t)(_r).regs[1])
+#define SET_ARCH_ARG1(_r, val) ((_r).regs[0] = (__u64)(val))
+#define SET_ARCH_ARG2(_r, val) ((_r).regs[1] = (__u64)(val))
 // On aarch64 the return value shares regs[0] with ARG1.
-#define SET_ARCH_RET(regs, val) ((regs).regs[0] = (__u64)(val))
+#define SET_ARCH_RET(_r, val) ((_r).regs[0] = (__u64)(val))
 #elif defined(__arm__)
 typedef struct user_regs arch_regs_t;
 #define ARCH_SP(regs) ((uintptr_t)(regs).uregs[13])
@@ -639,6 +643,122 @@ static void ensure_argv0(pid_t child, uintptr_t argv_ptr, uintptr_t sh_addr, con
     }
 }
 
+// Real Alpine binaries (/sbin/apk, /usr/bin/wget, ...) name a dynamic linker in
+// PT_INTERP ("/lib/ld-musl-aarch64.so.1") that does not exist on Android. The
+// kernel opens that interpreter itself, with no syscall of its own, so ptrace
+// can never rewrite the lookup — the exec fails with ENOENT even though both the
+// binary and the interpreter exist inside the rootfs. Running the interpreter
+// explicitly is the only thing that works, which is why
+// "/lib/ld-musl-*.so.1 /sbin/apk" succeeds where "/sbin/apk" does not.
+//
+// So: read the binary's PT_INTERP, map it into the rootfs, and turn the exec
+// into  execve(interp, [interp, path, argv[1..]], envp).
+//
+// Returns 1 when the syscall was rewritten (the caller must not redirect again),
+// 0 when the caller should carry on normally.
+static int redirect_via_musl_loader(pid_t cur_pid, arch_regs_t *regs, uintptr_t sp,
+                                    const char *host_path, const char *guest_path) {
+    int fd = open(host_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+
+    unsigned char ident[EI_NIDENT];
+    if (read(fd, ident, sizeof(ident)) != (ssize_t)sizeof(ident) ||
+        memcmp(ident, ELFMAG, SELFMAG) != 0) {
+        close(fd);
+        return 0;
+    }
+
+    // PT_INTERP is found through the program headers, whose layout differs
+    // between ELF32 and ELF64. The app ships 32-bit ABIs too, so both are read.
+    char interp[PATH_MAX] = {0};
+    if (ident[EI_CLASS] == ELFCLASS64) {
+        Elf64_Ehdr eh;
+        if (pread(fd, &eh, sizeof(eh), 0) == (ssize_t)sizeof(eh) &&
+            eh.e_phoff != 0 && eh.e_phnum != 0 &&
+            eh.e_phentsize == sizeof(Elf64_Phdr)) {
+            for (int i = 0; i < eh.e_phnum && interp[0] == '\0'; i++) {
+                Elf64_Phdr ph;
+                off_t off = (off_t)eh.e_phoff + (off_t)i * (off_t)sizeof(Elf64_Phdr);
+                if (pread(fd, &ph, sizeof(ph), off) != (ssize_t)sizeof(ph)) break;
+                if (ph.p_type != PT_INTERP || ph.p_filesz == 0 ||
+                    ph.p_filesz >= sizeof(interp)) continue;
+                if (pread(fd, interp, ph.p_filesz, (off_t)ph.p_offset) != (ssize_t)ph.p_filesz) break;
+                interp[sizeof(interp) - 1] = '\0';
+            }
+        }
+    } else if (ident[EI_CLASS] == ELFCLASS32) {
+        Elf32_Ehdr eh;
+        if (pread(fd, &eh, sizeof(eh), 0) == (ssize_t)sizeof(eh) &&
+            eh.e_phoff != 0 && eh.e_phnum != 0 &&
+            eh.e_phentsize == sizeof(Elf32_Phdr)) {
+            for (int i = 0; i < eh.e_phnum && interp[0] == '\0'; i++) {
+                Elf32_Phdr ph;
+                off_t off = (off_t)eh.e_phoff + (off_t)i * (off_t)sizeof(Elf32_Phdr);
+                if (pread(fd, &ph, sizeof(ph), off) != (ssize_t)sizeof(ph)) break;
+                if (ph.p_type != PT_INTERP || ph.p_filesz == 0 ||
+                    ph.p_filesz >= sizeof(interp)) continue;
+                if (pread(fd, interp, ph.p_filesz, (off_t)ph.p_offset) != (ssize_t)ph.p_filesz) break;
+                interp[sizeof(interp) - 1] = '\0';
+            }
+        }
+    }
+    close(fd);
+
+    if (interp[0] == '\0') return 0;
+
+    char interp_host[2048] = {0};
+    if (!resolve_vfs_path(interp, interp_host, sizeof(interp_host))) return 0;
+    if (access(interp_host, R_OK | X_OK) != 0) return 0;
+
+    uintptr_t argv_ptr = ARCH_ARG2(*regs);
+    if (argv_ptr == 0) return 0;
+
+    uintptr_t old_argv[64];
+    struct iovec r_l = { .iov_base = old_argv, .iov_len = sizeof(old_argv) };
+    struct iovec r_r = { .iov_base = (void*)argv_ptr, .iov_len = sizeof(old_argv) };
+    if (process_vm_readv(cur_pid, &r_l, 1, &r_r, 1, 0) <= 0) return 0;
+
+    size_t argc = 0;
+    while (argc < sizeof(old_argv) / sizeof(old_argv[0]) && old_argv[argc] != 0) argc++;
+    if (argc == 0 || argc >= sizeof(old_argv) / sizeof(old_argv[0]) - 2) return 0;
+
+    // Everything is written below the child's stack pointer, in three regions
+    // that cannot overlap: argv first (it grows with argc), then the two
+    // strings above it. write_to_child_scratch() always targets sp-2048, so the
+    // second string is written by hand rather than with a shifted stack pointer.
+    uintptr_t new_argv[66];
+    size_t n = 0;
+    new_argv[n++] = 0;   // filled in once the interp string address is known
+    new_argv[n++] = 0;   // guest binary path
+    for (size_t i = 1; i < argc; i++) new_argv[n++] = old_argv[i];
+    new_argv[n] = 0;
+
+    size_t argv_bytes = (n + 1) * sizeof(uintptr_t);
+    uintptr_t argv_addr = sp - 2048 - argv_bytes - 16;
+
+    uintptr_t interp_addr = write_to_child_scratch(cur_pid, sp, interp_host, strlen(interp_host) + 1);
+    if (interp_addr == 0) return 0;
+
+    uintptr_t path_addr = argv_addr - 512 - strlen(guest_path) - 1;
+    struct iovec p_l = { .iov_base = (void*)guest_path, .iov_len = strlen(guest_path) + 1 };
+    struct iovec p_r = { .iov_base = (void*)path_addr, .iov_len = strlen(guest_path) + 1 };
+    if (process_vm_writev(cur_pid, &p_l, 1, &p_r, 1, 0) != (ssize_t)(strlen(guest_path) + 1)) return 0;
+
+    new_argv[0] = interp_addr;
+    new_argv[1] = path_addr;
+
+    struct iovec a_l = { .iov_base = new_argv, .iov_len = argv_bytes };
+    struct iovec a_r = { .iov_base = (void*)argv_addr, .iov_len = argv_bytes };
+    if (process_vm_writev(cur_pid, &a_l, 1, &a_r, 1, 0) != (ssize_t)argv_bytes) return 0;
+
+    SET_ARCH_ARG1(*regs, interp_addr);
+    SET_ARCH_ARG2(*regs, argv_addr);
+    set_child_regs(cur_pid, regs);
+    SUP_INFO("PID %d: %s is musl-linked, exec via %s", cur_pid, guest_path, interp_host);
+    return 1;
+}
+
+
 // Verify that a helper binary really matches the CPU we are running on before we
 // hand the shell over to it. BusyBox is shipped as an Android native library
 // (libbusybox.so) so it is stored uncompressed and executable, which means the
@@ -911,6 +1031,11 @@ int main(int argc, char *argv[]) {
                                     char full_virtual[1024] = {0};
                                     resolve_relative_or_absolute(raw_path, ps->cwd, full_virtual, sizeof(full_virtual));
 
+                                    // /bin/* are symlinks to busybox, so they
+                                    // stay busybox applets. Everything else is a
+                                    // real ELF whose PT_INTERP names a musl
+                                    // loader the kernel opens with no syscall;
+                                    // hand those to the loader explicitly.
                                     if (strncmp(full_virtual, "/bin/", 5) == 0) {
                                         const char *applet = full_virtual + 5;
                                         char busybox_path[2048] = {0};
@@ -927,13 +1052,18 @@ int main(int argc, char *argv[]) {
                                         char rew_path[2048] = {0};
                                         struct stat st;
                                         int resolved = resolve_vfs_path(full_virtual, rew_path, sizeof(rew_path));
+                                        int redirected = 0;
                                         if (resolved && (stat(rew_path, &st) == 0 || lstat(rew_path, &st) == 0)) {
-                                            uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
-                                            if (scr != 0) {
-                                                SET_ARCH_ARG1(regs, scr);
-                                                set_child_regs(cur_pid, &regs);
-                                                SUP_INFO("PID %d: redirected execve %s -> %s",
-                                                         cur_pid, full_virtual, rew_path);
+                                            redirected = redirect_via_musl_loader(cur_pid, &regs, sp,
+                                                                                  rew_path, full_virtual);
+                                            if (!redirected) {
+                                                uintptr_t scr = write_to_child_scratch(cur_pid, sp, rew_path, strlen(rew_path)+1);
+                                                if (scr != 0) {
+                                                    SET_ARCH_ARG1(regs, scr);
+                                                    set_child_regs(cur_pid, &regs);
+                                                    SUP_INFO("PID %d: redirected execve %s -> %s",
+                                                             cur_pid, full_virtual, rew_path);
+                                                }
                                             }
                                         }
                                     }
