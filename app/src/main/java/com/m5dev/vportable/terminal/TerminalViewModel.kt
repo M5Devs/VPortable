@@ -19,11 +19,11 @@ import java.util.concurrent.Executors
 
 private const val TAG = "TerminalInput"
 
-// The terminal is rendered as one growing String, and applyBackspace rescans the
-// whole buffer on every read. A large install (apk add python3 emits ~54 MiB)
-// made that quadratic scan the main source of UI jank, so the scrollback is
-// capped and only the tail is kept.
-private const val MAX_SCROLLBACK_CHARS = 50_000
+// Lines kept in the scrollback buffer, and how many of them are published to
+// the UI. Rendering is bounded by the latter, so a huge install no longer makes
+// recomposition cost grow with total output.
+private const val MAX_SCROLLBACK_LINES = 800
+private const val MAX_VISIBLE_LINES = 300
 
 data class TerminalUiState(
     val isTerminalActive: Boolean = false,
@@ -42,6 +42,8 @@ class TerminalViewModel @JvmOverloads constructor(
 
     private var masterFd: Int = -1
     private var readJob: Job? = null
+
+    private val terminalBuffer = TerminalBuffer(maxLines = MAX_SCROLLBACK_LINES)
 
     // Single-threaded dispatcher: serialises PTY writes so keystrokes are not
     // reordered by the thread pool.
@@ -106,21 +108,28 @@ class TerminalViewModel @JvmOverloads constructor(
 
             readJob = launch {
                 try {
-                    bridge.readStream(masterFd).collect { text ->
-                        val clean = processAnsi(text)
+                    bridge.readStream(masterFd).collect { raw ->
+                        val clean = AnsiProcessor.strip(raw)
                         if (clean.isEmpty()) return@collect
                         Log.d(TAG, "nativeRead -> ${clean.length} chars")
-                        val combined = applyBackspace(_uiState.value.terminalOutput + clean)
-                        val trimmed = if (combined.length > MAX_SCROLLBACK_CHARS) {
-                            // Cut at a newline so the oldest visible line is not a
-                            // fragment of one that was dropped.
-                            val cutPoint = combined.indexOf('\n', combined.length - MAX_SCROLLBACK_CHARS)
-                            if (cutPoint > 0) combined.substring(cutPoint + 1)
-                            else combined.takeLast(MAX_SCROLLBACK_CHARS)
-                        } else {
-                            combined
+
+                        // The tty echoes a delete as BS followed by an erase
+                        // sequence, and that echo routinely arrives in a later
+                        // read() than the character it erases. Applying it to the
+                        // buffer's last line keeps that cross-chunk case working;
+                        // stripping it per chunk would not.
+                        var start = 0
+                        while (start < clean.length && clean[start] == '\b') {
+                            terminalBuffer.applyBackspace()
+                            start++
                         }
-                        _uiState.value = _uiState.value.copy(terminalOutput = trimmed)
+                        terminalBuffer.appendRaw(applyBackspace(clean.substring(start)))
+
+                        // Publish only the tail. Joining a bounded number of lines
+                        // keeps this O(visible) instead of O(total output).
+                        val visible = terminalBuffer.getVisibleLines(MAX_VISIBLE_LINES)
+                            .joinToString("\n")
+                        _uiState.value = _uiState.value.copy(terminalOutput = visible)
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "PTY read loop ended: ${t.message}")
@@ -139,30 +148,13 @@ class TerminalViewModel @JvmOverloads constructor(
         }
     }
 
-    private fun processAnsi(rawText: String): String {
-        var result = rawText
-        // CSI sequences: colours, cursor moves, erase-in-line.
-        result = result.replace(Regex("\u001B\\[[;\\d]*[A-Za-z]"), "")
-        // Two-byte escapes the CSI pattern above does not cover.
-        result = result.replace(Regex("\u001B[=>]"), "")
-        result = result.replace(Regex("\u001B\\([A-Z]"), "")
-        // The PTY sends CRLF; without this the CR survives and shows as a stray
-        // control character at the end of every line.
-        result = result.replace("\r\n", "\n")
-        // A bare CR is an in-place overwrite (apk progress bars emit
-        // "####\r#####\r..."). Turn it into a newline so each update is its own
-        // line instead of the whole bar collapsing onto one.
-        result = result.replace("\r", "\n")
-        return result
-    }
-
     /**
      * Applies the erase sequence the tty echoes when a key is deleted (the
-     * terminal sends BS then CSI-erase-down) to the text already on screen. The
-     * output is one growing string rendered by a plain Text, so without this the
-     * backspace was appended verbatim and the erased character stayed visible.
-     * Must run over the whole accumulated buffer, not per chunk: the echo of a
-     * delete routinely arrives in a later read() than the character it erases.
+     * terminal sends BS then CSI-erase-down). Without this the backspace was
+     * appended verbatim and the erased character stayed visible. Handles the
+     * case where the echo of a delete arrives in the same read as the character
+     * it erases; a leading backspace, whose character arrived in an earlier
+     * read, is applied to the buffer instead.
      * Idempotent, since the result contains no backspace.
      */
     private fun applyBackspace(text: String): String {
@@ -226,6 +218,7 @@ class TerminalViewModel @JvmOverloads constructor(
         bytes.joinToString(" ") { String.format("%02X", it) }
 
     fun clearScreen() {
+        terminalBuffer.clear()
         _uiState.value = _uiState.value.copy(terminalOutput = "")
     }
 
