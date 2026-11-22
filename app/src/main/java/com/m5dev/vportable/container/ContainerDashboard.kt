@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -64,6 +65,12 @@ fun ContainerDashboard(
     val state by viewModel.uiState.collectAsState()
     var message by remember { mutableStateOf<String?>(null) }
 
+    // The rootfs can be created or changed while the dashboard is not visible
+    // (e.g. the first terminal boot extracts it), so re-scan on each entry.
+    LaunchedEffect(Unit) {
+        viewModel.refresh()
+    }
+
     Box(modifier = modifier.fillMaxSize().background(DashBackground)) {
         Column(modifier = Modifier.fillMaxSize()) {
             DashboardHeader(
@@ -72,14 +79,27 @@ fun ContainerDashboard(
                 onTripleTap = onHeaderTripleTap
             )
 
-            if (state.containers.isEmpty()) {
-                EmptyState(
-                    isScanning = state.isScanning,
+            when {
+                state.isScanning && state.containers.isEmpty() -> {
+                    Box(
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(32.dp),
+                            color = DashGreen,
+                            strokeWidth = 3.dp
+                        )
+                    }
+                }
+
+                state.containers.isEmpty() -> EmptyState(
+                    isScanning = false,
                     onCreate = { message = "Coming soon: new container wizard" },
                     modifier = Modifier.weight(1f)
                 )
-            } else {
-                LazyColumn(
+
+                else -> LazyColumn(
                     modifier = Modifier.weight(1f),
                     contentPadding = PaddingValues(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -87,7 +107,19 @@ fun ContainerDashboard(
                     items(state.containers, key = { it.id }) { container ->
                         ContainerCard(
                             container = container,
-                            onOpenTerminal = { onOpenTerminal(container) },
+                            onOpenTerminal = {
+                                viewModel.updateContainerStatus(
+                                    container.id,
+                                    ContainerStatus.RUNNING
+                                )
+                                onOpenTerminal(container)
+                            },
+                            onStop = {
+                                viewModel.updateContainerStatus(
+                                    container.id,
+                                    ContainerStatus.STOPPED
+                                )
+                            },
                             onDelete = {
                                 message = "Delete is not available yet"
                             }
@@ -192,6 +224,7 @@ private fun DashboardHeader(
 private fun ContainerCard(
     container: ContainerInfo,
     onOpenTerminal: () -> Unit,
+    onStop: () -> Unit,
     onDelete: () -> Unit
 ) {
     val borderColor = when (container.status) {
@@ -255,7 +288,7 @@ private fun ContainerCard(
                     label = "■  Stop",
                     background = Color(0xFF3D1515),
                     contentColor = DashRed,
-                    onClick = { }
+                    onClick = onStop
                 )
 
                 else -> {

@@ -73,29 +73,56 @@ class MainActivity : ComponentActivity() {
                     var selectedContainer by remember { mutableStateOf<ContainerInfo?>(null) }
 
                     // The PTY is a single global session, so mirror its state onto
-                    // the container the user opened. Without this the RUNNING and
-                    // EXTRACTING styling would never appear.
+                    // the container the user opened; that is what makes RUNNING and
+                    // EXTRACTING appear at all.
                     val terminalState by terminalViewModel.uiState.collectAsState()
                     val activeContainerId = selectedContainer?.id
+
+                    // Set once the PTY has actually reported active for this
+                    // container. Without it the first emission (both flags false,
+                    // while startTerminal() is still spinning up) would overwrite
+                    // the optimistic RUNNING the card just set.
+                    var terminalWasActive by remember(activeContainerId) {
+                        mutableStateOf(false)
+                    }
+
                     LaunchedEffect(
                         terminalState.isTerminalActive,
                         terminalState.isExtractingRootfs,
                         activeContainerId
                     ) {
-                        if (activeContainerId == null) return@LaunchedEffect
-                        val status = when {
-                            terminalState.isTerminalActive -> ContainerStatus.RUNNING
-                            terminalState.isExtractingRootfs -> ContainerStatus.EXTRACTING
-                            else -> ContainerStatus.STOPPED
+                        val id = activeContainerId ?: return@LaunchedEffect
+                        when {
+                            terminalState.isTerminalActive -> {
+                                terminalWasActive = true
+                                containerViewModel.updateContainerStatus(
+                                    id, ContainerStatus.RUNNING
+                                )
+                            }
+
+                            terminalState.isExtractingRootfs -> {
+                                containerViewModel.updateContainerStatus(
+                                    id, ContainerStatus.EXTRACTING
+                                )
+                            }
+
+                            // Only report STOPPED for a session that really ended,
+                            // so a container that was merely opened keeps the
+                            // status its card set.
+                            terminalWasActive -> {
+                                terminalWasActive = false
+                                containerViewModel.updateContainerStatus(
+                                    id, ContainerStatus.STOPPED
+                                )
+                            }
                         }
-                        containerViewModel.updateContainerStatus(activeContainerId, status)
                     }
 
                     // Back returns to the dashboard from any other screen, and is
                     // consumed so it cannot also leave the activity.
                     BackHandler(enabled = currentScreen != SCREEN_DASHBOARD) {
                         currentScreen = SCREEN_DASHBOARD
-                        containerViewModel.scanContainers()
+                        containerViewModel.refresh()
                     }
 
                     when (currentScreen) {
@@ -117,10 +144,12 @@ class MainActivity : ComponentActivity() {
                                 viewModel = containerViewModel,
                                 onOpenTerminal = { container ->
                                     selectedContainer = container
+                                    currentScreen = SCREEN_TERMINAL
                                     // The PTY boots the on-disk rootfs; the
                                     // container id is kept for the header only.
+                                    // bootAlpine() does not exist in this tree —
+                                    // startTerminal() is the real entry point.
                                     terminalViewModel.startTerminal(context)
-                                    currentScreen = SCREEN_TERMINAL
                                 },
                                 modifier = Modifier.fillMaxSize(),
                                 onHeaderTripleTap = { currentScreen = SCREEN_TEST_HARNESS }
