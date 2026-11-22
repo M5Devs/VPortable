@@ -12,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -38,6 +39,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -134,30 +136,76 @@ fun TerminalScreen(
                 .focusRequester(inputFocusRequester)
         )
 
-        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-            // The idle prompt stands in for an empty session; TerminalCanvas draws
-            // whatever lines it is given, so supply the prompt as the only line.
-            val idlePrompt = state.terminalOutput.isEmpty() && !state.isTerminalActive
-            val terminalLines = remember(state.terminalOutput, idlePrompt) {
-                if (idlePrompt) listOf("~ $") else state.terminalOutput.split("\n")
+        // The idle prompt stands in for an empty session; TerminalCanvas draws
+        // whatever lines it is given, so supply the prompt as the only line.
+        val idlePrompt = state.terminalOutput.isEmpty() && !state.isTerminalActive
+        val terminalLines = remember(state.terminalOutput, idlePrompt) {
+            if (idlePrompt) listOf("~ $") else state.terminalOutput.split("\n")
+        }
+
+        // The PTY width is derived from what the canvas can actually draw, using
+        // the same paint and padding TerminalCanvas uses for clipping. A guessed
+        // character width disagrees with the real font metrics at non-default font
+        // scale, which puts the truncation back.
+        BoxWithConstraints(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(TermuxBackground)
+        ) {
+            val density = LocalDensity.current
+            val fontSizePx = with(density) { TERMINAL_FONT_SIZE.toPx() }
+            val paddingH = with(density) { TERMINAL_PADDING_H.toPx() }
+            val paddingV = with(density) { TERMINAL_PADDING_V.toPx() }
+
+            val textMetrics = remember(fontSizePx) {
+                val paint = terminalTextPaint(fontSizePx)
+                paint.measureText("M") to paint.fontSpacing
+            }
+            val charWidthPx = textMetrics.first
+            val lineHeightPx = textMetrics.second
+
+            val widthPx = with(density) { maxWidth.toPx() }
+            val heightPx = with(density) { maxHeight.toPx() }
+
+            // Clamped only to guard against nonsense geometry. The floor must stay
+            // below anything a real screen can produce: at 2.0x font scale a 320dp
+            // screen fits 19 columns, so a floor of 20 would widen the PTY past the
+            // canvas and clip output again.
+            val termCols = if (charWidthPx > 0f) {
+                ((widthPx - paddingH * 2) / charWidthPx).toInt().coerceIn(4, 400)
+            } else {
+                80
+            }
+            val termRows = if (lineHeightPx > 0f) {
+                ((heightPx - paddingV * 2) / lineHeightPx).toInt().coerceIn(2, 200)
+            } else {
+                24
             }
 
-            TerminalCanvas(
-                lines = terminalLines,
-                isCursorVisible = state.isTerminalActive || idlePrompt,
-                cursorAlpha = cursorAlpha,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null
-                    ) {
-                        if (state.isTerminalActive) {
-                            focusInput()
+            LaunchedEffect(termCols, termRows) {
+                viewModel.resizeTerminal(termCols, termRows)
+            }
+
+            // Terminal output is inherently LTR; without this an RTL locale
+            // mirrors the canvas and the cursor lands in the wrong place.
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                TerminalCanvas(
+                    lines = terminalLines,
+                    isCursorVisible = state.isTerminalActive || idlePrompt,
+                    cursorAlpha = cursorAlpha,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            if (state.isTerminalActive) {
+                                focusInput()
+                            }
                         }
-                    }
-            )
+                )
+            }
         }
 
         // Termux-Style Extra Keys Toolbar

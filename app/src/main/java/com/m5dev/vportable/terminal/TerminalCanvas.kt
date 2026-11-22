@@ -16,6 +16,27 @@ import androidx.compose.ui.unit.sp
 private val CanvasForeground = 0xFFF8F8F2.toInt()
 private val CanvasBackground = Color(0xFF000000)
 
+// Single source of truth for the terminal grid: TerminalScreen derives the PTY
+// columns/rows from these, and this composable draws with them.
+internal val TERMINAL_FONT_SIZE = 13.sp
+internal val TERMINAL_PADDING_H = 8.dp
+internal val TERMINAL_PADDING_V = 4.dp
+
+/**
+ * The paint used to draw terminal text.
+ *
+ * Shared with the column/row measurement in `TerminalScreen` so the PTY width and
+ * the clipping width are derived from exactly the same metrics; if they diverge,
+ * lines get cut at the canvas edge again.
+ */
+internal fun terminalTextPaint(textSizePx: Float): android.graphics.Paint =
+    android.graphics.Paint().apply {
+        isAntiAlias = true
+        color = CanvasForeground
+        textSize = textSizePx
+        typeface = android.graphics.Typeface.MONOSPACE
+    }
+
 /**
  * Draws terminal [lines] line-by-line with the platform text renderer.
  *
@@ -35,20 +56,13 @@ fun TerminalCanvas(
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
-    val fontSizePx = with(density) { 13.sp.toPx() }
-    val paddingH = with(density) { 8.dp.toPx() }
-    val paddingV = with(density) { 4.dp.toPx() }
+    val fontSizePx = with(density) { TERMINAL_FONT_SIZE.toPx() }
+    val paddingH = with(density) { TERMINAL_PADDING_H.toPx() }
+    val paddingV = with(density) { TERMINAL_PADDING_V.toPx() }
 
     // Keyed on the size so a font-scale or density change rebuilds the paint
     // instead of drawing at the old text size.
-    val textPaint = remember(fontSizePx) {
-        android.graphics.Paint().apply {
-            isAntiAlias = true
-            color = CanvasForeground
-            textSize = fontSizePx
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-    }
+    val textPaint = remember(fontSizePx) { terminalTextPaint(fontSizePx) }
 
     val cursorPaint = remember {
         android.graphics.Paint().apply {

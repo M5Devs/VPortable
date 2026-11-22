@@ -43,6 +43,14 @@ class TerminalViewModel @JvmOverloads constructor(
     private var masterFd: Int = -1
     private var readJob: Job? = null
 
+    // Size the UI last measured from the real canvas, and the size last pushed to
+    // the PTY. The former lets a PTY start at the true width instead of 80x24; the
+    // latter keeps rotation and IME changes from re-issuing an identical ioctl.
+    private var measuredCols = 0
+    private var measuredRows = 0
+    private var appliedCols = -1
+    private var appliedRows = -1
+
     private val terminalBuffer = TerminalBuffer(maxLines = MAX_SCROLLBACK_LINES)
 
     // Single-threaded dispatcher: serialises PTY writes so keystrokes are not
@@ -53,6 +61,11 @@ class TerminalViewModel @JvmOverloads constructor(
 
     fun startTerminal(context: Context, cols: Int = 80, rows: Int = 24) {
         if (_uiState.value.isTerminalActive || _uiState.value.isExtractingRootfs) return
+
+        // Prefer the size the UI has measured, so the shell starts at the real
+        // width instead of 80 columns and the first prompt is not wrapped wrongly.
+        val startCols = if (measuredCols > 0) measuredCols else cols
+        val startRows = if (measuredRows > 0) measuredRows else rows
 
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
@@ -88,8 +101,8 @@ class TerminalViewModel @JvmOverloads constructor(
                 bridge.nativeStartPty(
                     rootfsPath = rootfsDir.absolutePath,
                     nativeDir = nativeDir,
-                    cols = cols,
-                    rows = rows
+                    cols = startCols,
+                    rows = startRows
                 )
             }
 
@@ -101,6 +114,10 @@ class TerminalViewModel @JvmOverloads constructor(
             }
 
             masterFd = fd
+            // The PTY was created at this size, so record it as applied; otherwise
+            // the first resizeTerminal() from the UI would repeat an identical ioctl.
+            appliedCols = startCols
+            appliedRows = startRows
             _uiState.value = _uiState.value.copy(
                 isTerminalActive = true,
                 statusMessage = "Alpine Linux Shell (PTY Active)"
@@ -173,6 +190,30 @@ class TerminalViewModel @JvmOverloads constructor(
         return sb.toString()
     }
 
+    /**
+     * Resizes the PTY to the terminal grid the UI can actually display.
+     *
+     * The size is remembered even when no PTY is running yet: the screen is
+     * composed before the rootfs has finished extracting, so the first call
+     * arrives with `masterFd == -1`. Keeping it lets `startTerminal()` create the
+     * PTY at the right width instead of losing that measurement.
+     */
+    fun resizeTerminal(cols: Int, rows: Int) {
+        if (cols <= 0 || rows <= 0) return
+        measuredCols = cols
+        measuredRows = rows
+
+        val fd = masterFd
+        if (fd < 0) return
+        if (cols == appliedCols && rows == appliedRows) return
+
+        appliedCols = cols
+        appliedRows = rows
+        viewModelScope.launch(Dispatchers.IO) {
+            bridge.nativeResize(fd, cols, rows)
+        }
+    }
+
     fun sendRawInput(text: String) {
         if (masterFd < 0 || !_uiState.value.isTerminalActive) return
         Log.d(TAG, "sendRawInput ${formatBytes(text.toByteArray())}")
@@ -232,6 +273,9 @@ class TerminalViewModel @JvmOverloads constructor(
                 bridge.nativeClose(fdToClose)
             }
         }
+        // The next PTY is a fresh descriptor, so nothing has been applied to it yet.
+        appliedCols = -1
+        appliedRows = -1
         _uiState.value = _uiState.value.copy(
             isTerminalActive = false,
             statusMessage = "PTY Session Terminated"
