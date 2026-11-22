@@ -118,6 +118,32 @@ object VFlashEngine {
                 linkerConfig.writeText("# VPortable linker config\n")
                 onLog?.invoke("Network: wrote linkerconfig/ld.config.txt")
             }
+
+            // Trigger scripts run through a non-login shell, so PATH comes from
+            // the environment rather than /etc/profile. The shipped profile
+            // already exports the right PATH; only supply one when the image
+            // has no profile at all, or has one without a PATH export.
+            val profile = File(rootfsDir, "etc/profile")
+            val pathExport = "export PATH=/usr/local/sbin:/usr/local/bin:" +
+                "/usr/sbin:/usr/bin:/sbin:/bin\n"
+            when {
+                !profile.exists() -> {
+                    profile.parentFile?.mkdirs()
+                    profile.writeText(
+                        pathExport +
+                        "export HOME=/root\n" +
+                        "export TERM=xterm-256color\n"
+                    )
+                    onLog?.invoke("Network: wrote /etc/profile")
+                }
+                profile.readText().contains("PATH=") -> {
+                    onLog?.invoke("Network: /etc/profile already sets PATH")
+                }
+                else -> {
+                    profile.appendText("\n$pathExport")
+                    onLog?.invoke("Network: appended PATH to /etc/profile")
+                }
+            }
         } catch (e: Exception) {
             onLog?.invoke("Network setup warning: ${e.message}")
         }
@@ -218,6 +244,23 @@ val tarReader = TarInputStream(decompressStream)
                     }
                 }
             }
+        }
+
+        // apk's post-install triggers exec /bin/busybox by absolute path rather
+        // than through a symlink, so the real binary needs the bits even when
+        // its directory entry was already walked above.
+        val busyboxFile = File(rootfsDir, "bin/busybox")
+        if (busyboxFile.isFile && !isSymlink(busyboxFile)) {
+            busyboxFile.setExecutable(true, false)
+            busyboxFile.setReadable(true, false)
+        }
+
+        // apk lives in /sbin, which is walked above, but it is the one binary the
+        // whole flow depends on, so make its permissions explicit.
+        val apkFile = File(rootfsDir, "sbin/apk")
+        if (apkFile.isFile && !isSymlink(apkFile)) {
+            apkFile.setExecutable(true, false)
+            apkFile.setReadable(true, false)
         }
     }
 

@@ -19,6 +19,12 @@ import java.util.concurrent.Executors
 
 private const val TAG = "TerminalInput"
 
+// The terminal is rendered as one growing String, and applyBackspace rescans the
+// whole buffer on every read. A large install (apk add python3 emits ~54 MiB)
+// made that quadratic scan the main source of UI jank, so the scrollback is
+// capped and only the tail is kept.
+private const val MAX_SCROLLBACK_CHARS = 50_000
+
 data class TerminalUiState(
     val isTerminalActive: Boolean = false,
     val isExtractingRootfs: Boolean = false,
@@ -104,9 +110,17 @@ class TerminalViewModel @JvmOverloads constructor(
                         val clean = processAnsi(text)
                         if (clean.isEmpty()) return@collect
                         Log.d(TAG, "nativeRead -> ${clean.length} chars")
-                        _uiState.value = _uiState.value.copy(
-                            terminalOutput = applyBackspace(_uiState.value.terminalOutput + clean)
-                        )
+                        val combined = applyBackspace(_uiState.value.terminalOutput + clean)
+                        val trimmed = if (combined.length > MAX_SCROLLBACK_CHARS) {
+                            // Cut at a newline so the oldest visible line is not a
+                            // fragment of one that was dropped.
+                            val cutPoint = combined.indexOf('\n', combined.length - MAX_SCROLLBACK_CHARS)
+                            if (cutPoint > 0) combined.substring(cutPoint + 1)
+                            else combined.takeLast(MAX_SCROLLBACK_CHARS)
+                        } else {
+                            combined
+                        }
+                        _uiState.value = _uiState.value.copy(terminalOutput = trimmed)
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "PTY read loop ended: ${t.message}")
@@ -126,8 +140,20 @@ class TerminalViewModel @JvmOverloads constructor(
     }
 
     private fun processAnsi(rawText: String): String {
-        // Strip ANSI escape codes for clean monospaced rendering
-        return rawText.replace(Regex("\u001B\\[[;\\d]*[A-Za-z]"), "")
+        var result = rawText
+        // CSI sequences: colours, cursor moves, erase-in-line.
+        result = result.replace(Regex("\u001B\\[[;\\d]*[A-Za-z]"), "")
+        // Two-byte escapes the CSI pattern above does not cover.
+        result = result.replace(Regex("\u001B[=>]"), "")
+        result = result.replace(Regex("\u001B\\([A-Z]"), "")
+        // The PTY sends CRLF; without this the CR survives and shows as a stray
+        // control character at the end of every line.
+        result = result.replace("\r\n", "\n")
+        // A bare CR is an in-place overwrite (apk progress bars emit
+        // "####\r#####\r..."). Turn it into a newline so each update is its own
+        // line instead of the whole bar collapsing onto one.
+        result = result.replace("\r", "\n")
+        return result
     }
 
     /**
