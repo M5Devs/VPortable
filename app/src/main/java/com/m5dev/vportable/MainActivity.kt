@@ -2,6 +2,7 @@ package com.m5dev.vportable
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
@@ -26,32 +27,39 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
-import androidx.compose.material3.TabRowDefaults
-import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.m5dev.vportable.container.ContainerDashboard
+import com.m5dev.vportable.container.ContainerInfo
+import com.m5dev.vportable.container.ContainerStatus
+import com.m5dev.vportable.container.ContainerViewModel
 import com.m5dev.vportable.terminal.TerminalScreen
 import com.m5dev.vportable.terminal.TerminalViewModel
+
+private const val SCREEN_DASHBOARD = 0
+private const val SCREEN_TERMINAL = 1
+private const val SCREEN_TEST_HARNESS = 2
 
 class MainActivity : ComponentActivity() {
 
     private val mainViewModel: MainViewModel by viewModels()
     private val terminalViewModel: TerminalViewModel by viewModels()
+    private val containerViewModel: ContainerViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,57 +67,64 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = Color(0xFF121212)
+                    color = Color(0xFF0D0D0D)
                 ) {
-                    var selectedTabIndex by remember { mutableIntStateOf(0) }
+                    var currentScreen by remember { mutableIntStateOf(SCREEN_DASHBOARD) }
+                    var selectedContainer by remember { mutableStateOf<ContainerInfo?>(null) }
 
-                    Column(modifier = Modifier.fillMaxSize()) {
-                        TabRow(
-                            selectedTabIndex = selectedTabIndex,
-                            containerColor = Color(0xFF1E1E1E),
-                            contentColor = Color.White,
-                            indicator = { tabPositions ->
-                                TabRowDefaults.SecondaryIndicator(
-                                    Modifier.tabIndicatorOffset(tabPositions[selectedTabIndex]),
-                                    color = Color(0xFF69F0AE)
-                                )
-                            }
-                        ) {
-                            Tab(
-                                selected = selectedTabIndex == 0,
-                                onClick = { selectedTabIndex = 0 },
-                                text = {
-                                    Text(
-                                        "Test Harness",
-                                        fontWeight = if (selectedTabIndex == 0) FontWeight.Bold else FontWeight.Normal,
-                                        color = if (selectedTabIndex == 0) Color(0xFF69F0AE) else Color.LightGray
-                                    )
-                                }
-                            )
-                            Tab(
-                                selected = selectedTabIndex == 1,
-                                onClick = { selectedTabIndex = 1 },
-                                text = {
-                                    Text(
-                                        "Interactive Terminal",
-                                        fontWeight = if (selectedTabIndex == 1) FontWeight.Bold else FontWeight.Normal,
-                                        color = if (selectedTabIndex == 1) Color(0xFF69F0AE) else Color.LightGray
-                                    )
-                                }
-                            )
+                    // The PTY is a single global session, so mirror its state onto
+                    // the container the user opened. Without this the RUNNING and
+                    // EXTRACTING styling would never appear.
+                    val terminalState by terminalViewModel.uiState.collectAsState()
+                    val activeContainerId = selectedContainer?.id
+                    LaunchedEffect(
+                        terminalState.isTerminalActive,
+                        terminalState.isExtractingRootfs,
+                        activeContainerId
+                    ) {
+                        if (activeContainerId == null) return@LaunchedEffect
+                        val status = when {
+                            terminalState.isTerminalActive -> ContainerStatus.RUNNING
+                            terminalState.isExtractingRootfs -> ContainerStatus.EXTRACTING
+                            else -> ContainerStatus.STOPPED
                         }
+                        containerViewModel.updateContainerStatus(activeContainerId, status)
+                    }
 
-                        when (selectedTabIndex) {
-                            0 -> {
-                                val state by mainViewModel.uiState.collectAsState()
+                    // Back returns to the dashboard from any other screen, and is
+                    // consumed so it cannot also leave the activity.
+                    BackHandler(enabled = currentScreen != SCREEN_DASHBOARD) {
+                        currentScreen = SCREEN_DASHBOARD
+                        containerViewModel.scanContainers()
+                    }
+
+                    when (currentScreen) {
+                        SCREEN_TERMINAL -> TerminalScreen(viewModel = terminalViewModel)
+
+                        SCREEN_TEST_HARNESS -> {
+                            val state by mainViewModel.uiState.collectAsState()
+                            Column(modifier = Modifier.fillMaxSize()) {
                                 Gate1TestHarnessScreen(
                                     state = state,
                                     onRunTest = { mainViewModel.runSyscallTest() }
                                 )
                             }
-                            1 -> {
-                                TerminalScreen(viewModel = terminalViewModel)
-                            }
+                        }
+
+                        else -> {
+                            val context = LocalContext.current
+                            ContainerDashboard(
+                                viewModel = containerViewModel,
+                                onOpenTerminal = { container ->
+                                    selectedContainer = container
+                                    // The PTY boots the on-disk rootfs; the
+                                    // container id is kept for the header only.
+                                    terminalViewModel.startTerminal(context)
+                                    currentScreen = SCREEN_TERMINAL
+                                },
+                                modifier = Modifier.fillMaxSize(),
+                                onHeaderTripleTap = { currentScreen = SCREEN_TEST_HARNESS }
+                            )
                         }
                     }
                 }
