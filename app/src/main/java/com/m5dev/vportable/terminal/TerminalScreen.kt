@@ -12,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -19,11 +20,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -41,21 +39,16 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextDirection
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 
 private val TermuxBackground = Color(0xFF000000)
-private val TermuxForeground = Color(0xFFF8F8F2)
 private val TermuxGreen = Color(0xFF50FA7B)
 private val TermuxRed = Color(0xFFFF5555)
 private val TermuxAmber = Color(0xFFFFB86C)
@@ -133,14 +126,6 @@ fun TerminalScreen(
             onKill = { viewModel.closeTerminal() }
         )
 
-        // Auto-scrolling terminal canvas
-        val scrollState = rememberScrollState()
-        LaunchedEffect(state.terminalOutput) {
-            if (state.terminalOutput.isNotEmpty()) {
-                scrollState.animateScrollTo(scrollState.maxValue)
-            }
-        }
-
         // Raw input surface. It renders nothing and keeps no text buffer, so the
         // IME's composition state is never invalidated by us.
         AndroidView(
@@ -151,51 +136,75 @@ fun TerminalScreen(
                 .focusRequester(inputFocusRequester)
         )
 
-        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .background(TermuxBackground)
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null
-                    ) {
-                        if (state.isTerminalActive) {
-                            focusInput()
-                        }
-                    }
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
-            ) {
-                val idlePrompt = state.terminalOutput.isEmpty() && !state.isTerminalActive
+        // The idle prompt stands in for an empty session; TerminalCanvas draws
+        // whatever lines it is given, so supply the prompt as the only line.
+        val idlePrompt = state.terminalOutput.isEmpty() && !state.isTerminalActive
+        val terminalLines = remember(state.terminalOutput, idlePrompt) {
+            if (idlePrompt) listOf("~ $") else state.terminalOutput.split("\n")
+        }
 
-                SelectionContainer {
-                    Text(
-                        // The cursor is concatenated into the output text. A sibling
-                        // Text in a Row would be pushed off-screen by the full-width
-                        // multi-line output above it.
-                        text = buildAnnotatedString {
-                            if (idlePrompt) {
-                                withStyle(SpanStyle(color = TermuxGreen)) { append("~ $") }
-                            } else {
-                                append(state.terminalOutput)
+        // The PTY width is derived from what the canvas can actually draw, using
+        // the same paint and padding TerminalCanvas uses for clipping. A guessed
+        // character width disagrees with the real font metrics at non-default font
+        // scale, which puts the truncation back.
+        BoxWithConstraints(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(TermuxBackground)
+        ) {
+            val density = LocalDensity.current
+            val fontSizePx = with(density) { TERMINAL_FONT_SIZE.toPx() }
+            val paddingH = with(density) { TERMINAL_PADDING_H.toPx() }
+            val paddingV = with(density) { TERMINAL_PADDING_V.toPx() }
+
+            val textMetrics = remember(fontSizePx) {
+                val paint = terminalTextPaint(fontSizePx)
+                paint.measureText("M") to paint.fontSpacing
+            }
+            val charWidthPx = textMetrics.first
+            val lineHeightPx = textMetrics.second
+
+            val widthPx = with(density) { maxWidth.toPx() }
+            val heightPx = with(density) { maxHeight.toPx() }
+
+            // Clamped only to guard against nonsense geometry. The floor must stay
+            // below anything a real screen can produce: at 2.0x font scale a 320dp
+            // screen fits 19 columns, so a floor of 20 would widen the PTY past the
+            // canvas and clip output again.
+            val termCols = if (charWidthPx > 0f) {
+                ((widthPx - paddingH * 2) / charWidthPx).toInt().coerceIn(4, 400)
+            } else {
+                80
+            }
+            val termRows = if (lineHeightPx > 0f) {
+                ((heightPx - paddingV * 2) / lineHeightPx).toInt().coerceIn(2, 200)
+            } else {
+                24
+            }
+
+            LaunchedEffect(termCols, termRows) {
+                viewModel.resizeTerminal(termCols, termRows)
+            }
+
+            // Terminal output is inherently LTR; without this an RTL locale
+            // mirrors the canvas and the cursor lands in the wrong place.
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                TerminalCanvas(
+                    lines = terminalLines,
+                    isCursorVisible = state.isTerminalActive || idlePrompt,
+                    cursorAlpha = cursorAlpha,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            if (state.isTerminalActive) {
+                                focusInput()
                             }
-                            if (state.isTerminalActive || idlePrompt) {
-                                withStyle(SpanStyle(color = TermuxForeground.copy(alpha = cursorAlpha))) {
-                                    append("█")
-                                }
-                            }
-                        },
-                        color = TermuxForeground,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 13.sp,
-                        lineHeight = 18.sp,
-                        style = TextStyle(textDirection = TextDirection.Ltr),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .verticalScroll(scrollState)
-                    )
-                }
+                        }
+                )
             }
         }
 

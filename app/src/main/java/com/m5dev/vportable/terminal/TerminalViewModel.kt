@@ -19,6 +19,12 @@ import java.util.concurrent.Executors
 
 private const val TAG = "TerminalInput"
 
+// Lines kept in the scrollback buffer, and how many of them are published to
+// the UI. Rendering is bounded by the latter, so a huge install no longer makes
+// recomposition cost grow with total output.
+private const val MAX_SCROLLBACK_LINES = 800
+private const val MAX_VISIBLE_LINES = 300
+
 data class TerminalUiState(
     val isTerminalActive: Boolean = false,
     val isExtractingRootfs: Boolean = false,
@@ -37,6 +43,16 @@ class TerminalViewModel @JvmOverloads constructor(
     private var masterFd: Int = -1
     private var readJob: Job? = null
 
+    // Size the UI last measured from the real canvas, and the size last pushed to
+    // the PTY. The former lets a PTY start at the true width instead of 80x24; the
+    // latter keeps rotation and IME changes from re-issuing an identical ioctl.
+    private var measuredCols = 0
+    private var measuredRows = 0
+    private var appliedCols = -1
+    private var appliedRows = -1
+
+    private val terminalBuffer = TerminalBuffer(maxLines = MAX_SCROLLBACK_LINES)
+
     // Single-threaded dispatcher: serialises PTY writes so keystrokes are not
     // reordered by the thread pool.
     private val writeDispatcher = Executors.newSingleThreadExecutor { runnable ->
@@ -45,6 +61,11 @@ class TerminalViewModel @JvmOverloads constructor(
 
     fun startTerminal(context: Context, cols: Int = 80, rows: Int = 24) {
         if (_uiState.value.isTerminalActive || _uiState.value.isExtractingRootfs) return
+
+        // Prefer the size the UI has measured, so the shell starts at the real
+        // width instead of 80 columns and the first prompt is not wrapped wrongly.
+        val startCols = if (measuredCols > 0) measuredCols else cols
+        val startRows = if (measuredRows > 0) measuredRows else rows
 
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
@@ -80,8 +101,8 @@ class TerminalViewModel @JvmOverloads constructor(
                 bridge.nativeStartPty(
                     rootfsPath = rootfsDir.absolutePath,
                     nativeDir = nativeDir,
-                    cols = cols,
-                    rows = rows
+                    cols = startCols,
+                    rows = startRows
                 )
             }
 
@@ -93,6 +114,10 @@ class TerminalViewModel @JvmOverloads constructor(
             }
 
             masterFd = fd
+            // The PTY was created at this size, so record it as applied; otherwise
+            // the first resizeTerminal() from the UI would repeat an identical ioctl.
+            appliedCols = startCols
+            appliedRows = startRows
             _uiState.value = _uiState.value.copy(
                 isTerminalActive = true,
                 statusMessage = "Alpine Linux Shell (PTY Active)"
@@ -100,13 +125,28 @@ class TerminalViewModel @JvmOverloads constructor(
 
             readJob = launch {
                 try {
-                    bridge.readStream(masterFd).collect { text ->
-                        val clean = processAnsi(text)
+                    bridge.readStream(masterFd).collect { raw ->
+                        val clean = AnsiProcessor.strip(raw)
                         if (clean.isEmpty()) return@collect
                         Log.d(TAG, "nativeRead -> ${clean.length} chars")
-                        _uiState.value = _uiState.value.copy(
-                            terminalOutput = applyBackspace(_uiState.value.terminalOutput + clean)
-                        )
+
+                        // The tty echoes a delete as BS followed by an erase
+                        // sequence, and that echo routinely arrives in a later
+                        // read() than the character it erases. Applying it to the
+                        // buffer's last line keeps that cross-chunk case working;
+                        // stripping it per chunk would not.
+                        var start = 0
+                        while (start < clean.length && clean[start] == '\b') {
+                            terminalBuffer.applyBackspace()
+                            start++
+                        }
+                        terminalBuffer.appendRaw(applyBackspace(clean.substring(start)))
+
+                        // Publish only the tail. Joining a bounded number of lines
+                        // keeps this O(visible) instead of O(total output).
+                        val visible = terminalBuffer.getVisibleLines(MAX_VISIBLE_LINES)
+                            .joinToString("\n")
+                        _uiState.value = _uiState.value.copy(terminalOutput = visible)
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "PTY read loop ended: ${t.message}")
@@ -125,18 +165,13 @@ class TerminalViewModel @JvmOverloads constructor(
         }
     }
 
-    private fun processAnsi(rawText: String): String {
-        // Strip ANSI escape codes for clean monospaced rendering
-        return rawText.replace(Regex("\u001B\\[[;\\d]*[A-Za-z]"), "")
-    }
-
     /**
      * Applies the erase sequence the tty echoes when a key is deleted (the
-     * terminal sends BS then CSI-erase-down) to the text already on screen. The
-     * output is one growing string rendered by a plain Text, so without this the
-     * backspace was appended verbatim and the erased character stayed visible.
-     * Must run over the whole accumulated buffer, not per chunk: the echo of a
-     * delete routinely arrives in a later read() than the character it erases.
+     * terminal sends BS then CSI-erase-down). Without this the backspace was
+     * appended verbatim and the erased character stayed visible. Handles the
+     * case where the echo of a delete arrives in the same read as the character
+     * it erases; a leading backspace, whose character arrived in an earlier
+     * read, is applied to the buffer instead.
      * Idempotent, since the result contains no backspace.
      */
     private fun applyBackspace(text: String): String {
@@ -153,6 +188,30 @@ class TerminalViewModel @JvmOverloads constructor(
             }
         }
         return sb.toString()
+    }
+
+    /**
+     * Resizes the PTY to the terminal grid the UI can actually display.
+     *
+     * The size is remembered even when no PTY is running yet: the screen is
+     * composed before the rootfs has finished extracting, so the first call
+     * arrives with `masterFd == -1`. Keeping it lets `startTerminal()` create the
+     * PTY at the right width instead of losing that measurement.
+     */
+    fun resizeTerminal(cols: Int, rows: Int) {
+        if (cols <= 0 || rows <= 0) return
+        measuredCols = cols
+        measuredRows = rows
+
+        val fd = masterFd
+        if (fd < 0) return
+        if (cols == appliedCols && rows == appliedRows) return
+
+        appliedCols = cols
+        appliedRows = rows
+        viewModelScope.launch(Dispatchers.IO) {
+            bridge.nativeResize(fd, cols, rows)
+        }
     }
 
     fun sendRawInput(text: String) {
@@ -200,6 +259,7 @@ class TerminalViewModel @JvmOverloads constructor(
         bytes.joinToString(" ") { String.format("%02X", it) }
 
     fun clearScreen() {
+        terminalBuffer.clear()
         _uiState.value = _uiState.value.copy(terminalOutput = "")
     }
 
@@ -213,6 +273,9 @@ class TerminalViewModel @JvmOverloads constructor(
                 bridge.nativeClose(fdToClose)
             }
         }
+        // The next PTY is a fresh descriptor, so nothing has been applied to it yet.
+        appliedCols = -1
+        appliedRows = -1
         _uiState.value = _uiState.value.copy(
             isTerminalActive = false,
             statusMessage = "PTY Session Terminated"
