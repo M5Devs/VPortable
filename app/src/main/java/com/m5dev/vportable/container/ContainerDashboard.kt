@@ -35,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -52,13 +53,14 @@ private val DashBorder = Color(0xFF333333)
 /**
  * Container list, styled after Winlator's container manager.
  *
- * [onOpenTerminal] is invoked with the container the user wants a shell in; the
- * host decides what that means.
+ * [onOpenTerminal] is invoked with the container the user wants a shell in, or
+ * with `null` for the header button, which opens a terminal without tying it to
+ * a specific container. The host decides what either case means.
  */
 @Composable
 fun ContainerDashboard(
     viewModel: ContainerViewModel,
-    onOpenTerminal: (ContainerInfo) -> Unit,
+    onOpenTerminal: (ContainerInfo?) -> Unit,
     modifier: Modifier = Modifier,
     onHeaderTripleTap: () -> Unit = {}
 ) {
@@ -76,7 +78,8 @@ fun ContainerDashboard(
             DashboardHeader(
                 arch = state.deviceArch,
                 androidVersion = state.androidVersion,
-                onTripleTap = onHeaderTripleTap
+                onTripleTap = onHeaderTripleTap,
+                onOpenTerminal = { onOpenTerminal(null) }
             )
 
             when {
@@ -161,7 +164,8 @@ private const val TAP_WINDOW_MS = 600L
 private fun DashboardHeader(
     arch: String,
     androidVersion: String,
-    onTripleTap: () -> Unit
+    onTripleTap: () -> Unit,
+    onOpenTerminal: () -> Unit
 ) {
     // The developer entry point is a triple-tap on the title, so it stays out of
     // the normal flow.
@@ -204,18 +208,42 @@ private fun DashboardHeader(
         }
 
         Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(10.dp))
-                .background(DashChip)
-                .padding(horizontal = 8.dp, vertical = 4.dp)
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            // Always reachable, even with no containers: otherwise the terminal
+            // could only be opened from a card's Shell button.
             Text(
-                text = "$arch · $androidVersion",
-                color = DashSecondary,
-                fontSize = 10.sp,
+                text = ">_",
+                color = DashGreen,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace,
-                maxLines = 1
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color(0xFF1A472A))
+                    .clickable(onClick = onOpenTerminal)
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
             )
+
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(DashChip)
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = "$arch · $androidVersion",
+                    color = DashSecondary,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    // The terminal button takes width out of this row; on a
+                    // narrow screen the chip shrinks rather than clipping mid
+                    // glyph.
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }

@@ -143,12 +143,15 @@ class MainActivity : ComponentActivity() {
                             ContainerDashboard(
                                 viewModel = containerViewModel,
                                 onOpenTerminal = { container ->
+                                    // Null comes from the header button, which
+                                    // opens a terminal without a specific
+                                    // container; both paths boot the same rootfs
+                                    // until multi-container is wired up.
                                     selectedContainer = container
                                     currentScreen = SCREEN_TERMINAL
-                                    // The PTY boots the on-disk rootfs; the
-                                    // container id is kept for the header only.
                                     // bootAlpine() does not exist in this tree —
-                                    // startTerminal() is the real entry point.
+                                    // startTerminal() is the real entry point and
+                                    // guards against a double start.
                                     terminalViewModel.startTerminal(context)
                                 },
                                 modifier = Modifier.fillMaxSize(),
